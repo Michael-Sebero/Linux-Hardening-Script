@@ -1,4 +1,31 @@
 #!/bin/bash
+
+sudo ufw limit 22/tcp  
+sudo ufw allow 80/tcp  
+sudo ufw allow 443/tcp  
+sudo ufw default deny incoming  
+sudo ufw default allow outgoing
+sudo ufw enable
+
+sudo sysctl kernel.modules_disabled=1
+sudo sysctl -a
+sudo sysctl -A
+sudo sysctl mib
+sudo sysctl net.ipv4.conf.all.rp_filter
+sudo sysctl -a --pattern 'net.ipv4.conf.(eth|wlan)0.arp'
+
+cat <<EOF > /etc/host.conf
+order bind,hosts
+multi on
+EOF
+
+sudo cp jail.local /etc/fail2ban/
+sudo systemctl enable fail2ban
+sudo systemctl start fail2ban
+
+echo "listening ports"
+sudo netstat -tunlp
+
 set -e
 echo "Changing umask permissions..."
 umask 0027
