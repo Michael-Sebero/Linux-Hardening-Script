@@ -6,4 +6,4 @@
 ## How to use
 . cd /directory/of/file
 
-. sh hardening script.sh
+. sudo sh hardening script.sh
