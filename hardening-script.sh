@@ -38,7 +38,6 @@ cat confs/etc-conf-d-wireless-regdom > /etc/conf.d/wireless-regdom
 cat confs/etc-crypttab > /etc/crypttab
 cat confs/etc-dhclient-conf > /etc/dhclient.conf
 cat confs/etc-environment > /etc/environment
-cat confs/etc-fstab > /etc/fstab
 cat confs/etc-hardening-wrapper-conf > /etc/hardening-wrapper.conf
 cat confs/etc-iptables-ip6tables.rules > /etc/iptables/ip6tables.rules
 cat confs/etc-iptables-iptables.rules > /etc/iptables/iptables.rules
