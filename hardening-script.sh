@@ -36,6 +36,8 @@ cat confs/etc-aide-conf > /etc/aide.conf
 cat confs/etc-bash-bashrc > /etc/bash.bashrc
 cat confs/etc-conf-d-wireless-regdom > /etc/conf.d/wireless-regdom
 cat confs/etc-crypttab > /etc/crypttab
+cat confs/etc-default-passwd > /etc/default/passwd
+cat confs/etc-default-useradd > /etc/default/useradd
 cat confs/etc-dhclient-conf > /etc/dhclient.conf
 cat confs/etc-environment > /etc/environment
 cat confs/etc-hardening-wrapper-conf > /etc/hardening-wrapper.conf
@@ -62,6 +64,8 @@ cat confs/etc-shells > /etc/shells
 cat confs/etc-ssh-ssh_config > /etc/ssh/ssh_config
 cat confs/etc-ssh-sshd_config > /etc/ssh/sshd_config
 cat confs/etc-sudoers > /etc/sudoers
+cat confs/etc-sysctl-d-05-grsecurity-conf > /etc/sysctl.d/05-grsecurity.conf
+cat confs/etc-sysctl-d-10-sysctl-conf > /etc/sysctl.d/10-sysctl.conf
 cat confs/etc-vconsole-conf > /etc/vconsole.conf
 cat confs/etc-wpa_supplicant-wpa-supplicant-conf > /etc/wpa_supplicant/wpa-supplicant.conf
 cat confs/etc-zsh-zprofile > /etc/zsh/zprofile
