@@ -1,5 +1,5 @@
 ## Requirements
- ufw
+. ufw
 
 . fail2ban
 
