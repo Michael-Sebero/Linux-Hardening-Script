@@ -1,7 +1,7 @@
 ## Requirements
-. ufw
+. UFW
 
-. fail2ban
+. Fail2Ban
 
 ## How to use
 . cd /directory/of/file
