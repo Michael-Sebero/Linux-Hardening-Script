@@ -1,24 +1,40 @@
 #!/bin/bash
 su -c '
 
-set -e
+# Ensure output is unbuffered
+exec 1> >(stdbuf -o0 cat)
+exec 2> >(stdbuf -o0 cat >&2)
+
+# Print section header
+print_section() {
+    echo ""
+    echo "================================================================"
+    echo "  $1"
+    echo "================================================================"
+}
 
 # Print formatted status messages
 status() {
     printf "%-60s" "$1..."
+    sync
 }
 
 ok() {
     echo " done"
+    sync
 }
 
 info() {
     echo "$1"
 }
 
+print_section "Starting system hardening process"
+
 # ========================================================
 # FILE PERMISSIONS
 # ========================================================
+print_section "File Permissions"
+
 status "setting secure file permissions"
 chmod 700 /root
 chmod 600 /etc/shadow /etc/gshadow
@@ -44,6 +60,8 @@ ok
 # ========================================================
 # KERNEL MODULE CONFIGURATION
 # ========================================================
+print_section "Kernel Module Configuration"
+
 status "loading netfilter modules"
 MODPROBE="/sbin/modprobe"
 "$MODPROBE" nf_conntrack_ftp 2>/dev/null || "$MODPROBE" ip_conntrack_ftp 2>/dev/null || true
@@ -99,7 +117,9 @@ ok
 # ========================================================
 # TCP/IP STACK HARDENING
 # ========================================================
-status "hardening TCP/IP stack"
+print_section "TCP/IP Stack Hardening"
+
+status "hardening TCP/IP stack (runtime)"
 # IP spoofing protection
 for i in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 1 > "$i" 2>/dev/null || true; done
 
@@ -127,6 +147,8 @@ ok
 # ========================================================
 # IPTABLES FIREWALL CONFIGURATION
 # ========================================================
+print_section "Iptables Firewall Configuration"
+
 IPTABLES="/sbin/iptables"
 SSHPORT="22"
 
@@ -274,6 +296,8 @@ ok
 # ========================================================
 # IPv6 FIREWALL
 # ========================================================
+print_section "IPv6 Firewall (Block All)"
+
 IP6TABLES="/sbin/ip6tables"
 
 status "configuring ip6tables (block all)"
@@ -292,6 +316,8 @@ ok
 # ========================================================
 # SYSTEM CONFIGURATION FILES
 # ========================================================
+print_section "System Configuration Files"
+
 status "configuring bash environment"
 cat > /etc/bash.bashrc <<'EOF'
 # /etc/bash.bashrc
@@ -745,6 +771,8 @@ ok
 # ========================================================
 # SSH CLIENT CONFIGURATION
 # ========================================================
+print_section "SSH Client Configuration"
+
 status "configuring SSH client"
 mkdir -p /etc/ssh
 cat > /etc/ssh/ssh_config <<'EOF'
@@ -774,6 +802,8 @@ ok
 # ========================================================
 # AIDE CONFIGURATION
 # ========================================================
+print_section "AIDE Intrusion Detection"
+
 status "configuring AIDE"
 mkdir -p /var/lib/aide /var/log/aide
 cat > /etc/aide.conf <<'EOF'
@@ -844,6 +874,8 @@ ok
 # ========================================================
 # FINAL PERMISSIONS
 # ========================================================
+print_section "Final File Permissions"
+
 status "setting final file permissions"
 chmod 600 /etc/ssh/ssh_config
 chmod 600 /etc/aide.conf 2>/dev/null || true
@@ -862,31 +894,6 @@ chmod 644 /etc/makepkg.conf
 chmod 644 /etc/conf.d/wireless-regdom
 chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null || true
 ok
-
-# ========================================================
-# BACKUP
-# ========================================================
-status "creating configuration backup"
-BACKUP_DIR="/root/security-backup-$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$BACKUP_DIR"
-cp -p /etc/ssh/sshd_config "$BACKUP_DIR/" 2>/dev/null || true
-cp -p /etc/sysctl.conf "$BACKUP_DIR/" 2>/dev/null || true
-cp -p /etc/security/limits.conf "$BACKUP_DIR/" 2>/dev/null || true
-iptables-save > "$BACKUP_DIR/iptables.backup"
-ip6tables-save > "$BACKUP_DIR/ip6tables.backup"
-ok
-
-# ========================================================
-# SUMMARY
-# ========================================================
-echo ""
-info "System hardening complete."
-echo ""
-info "Configuration backup: $BACKUP_DIR"
-info "Initialize AIDE: aide --init && mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz"
-info "Review rules: iptables -L -v -n"
-info "Reboot required for full effect."
-echo ""
 
 exit 0
 '
