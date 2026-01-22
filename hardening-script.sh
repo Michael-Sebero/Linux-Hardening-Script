@@ -872,6 +872,42 @@ EOF
 ok
 
 # ========================================================
+# MISC
+# ========================================================
+
+status "configuring stricter default umask"
+cat > /etc/profile.d/umask.sh <<'EOF'
+# Set stricter umask for security
+umask 027
+EOF
+chmod +x /etc/profile.d/umask.sh
+ok
+
+status "restricting cron and at access"
+echo "root" > /etc/cron.allow
+chmod 600 /etc/cron.allow
+[ -f /etc/cron.deny ] && rm /etc/cron.deny
+
+if command -v at >/dev/null 2>&1; then
+    echo "root" > /etc/at.allow
+    chmod 600 /etc/at.allow
+    [ -f /etc/at.deny ] && rm /etc/at.deny
+fi
+ok
+
+status "configuring PAM faillock"
+mkdir -p /etc/security
+cat > /etc/security/faillock.conf <<'EOF'
+# Deny access after 5 failed attempts
+deny = 5
+# Unlock time in seconds (15 minutes)
+unlock_time = 900
+# Fail interval (15 minutes)
+fail_interval = 900
+EOF
+ok
+
+# ========================================================
 # FINAL PERMISSIONS
 # ========================================================
 print_section "Final File Permissions"
@@ -892,7 +928,31 @@ chmod 644 /etc/issue /etc/issue.net
 chmod 644 /etc/shells /etc/securetty /etc/vconsole.conf
 chmod 644 /etc/makepkg.conf
 chmod 644 /etc/conf.d/wireless-regdom
+chmod 644 /etc/hosts
+chmod 644 /etc/hostname
+chmod 644 /etc/networks
+chmod 600 /etc/security/access.conf 2>/dev/null || true
+chmod 600 /etc/security/limits.conf 2>/dev/null || true
+chmod 700 /root/.ssh 2>/dev/null || true
+chmod 600 /root/.ssh/* 2>/dev/null || true
+chmod 644 /etc/hosts.allow 2>/dev/null || true
+chmod 644 /etc/hosts.deny 2>/dev/null || true
 chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null || true
+ok
+
+status "securing bootloader configuration"
+if [ -f /boot/grub/grub.cfg ]; then
+    chmod 600 /boot/grub/grub.cfg
+    chown root:root /boot/grub/grub.cfg
+fi
+if [ -d /boot/grub2 ]; then
+    chmod 600 /boot/grub2/grub.cfg 2>/dev/null || true
+    chown root:root /boot/grub2/grub.cfg 2>/dev/null || true
+fi
+if [ -d /boot/loader ]; then
+    chmod 700 /boot/loader 2>/dev/null || true
+fi
+
 ok
 
 exit 0
