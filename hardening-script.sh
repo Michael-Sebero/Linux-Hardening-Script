@@ -1,31 +1,28 @@
 #!/bin/bash
-su -c '
 
-# Ensure output is unbuffered
-exec 1> >(stdbuf -o0 cat)
-exec 2> >(stdbuf -o0 cat >&2)
+# Force unbuffered output for immediate visibility
+export PYTHONUNBUFFERED=1
+stty -icanon min 1 time 0 2>/dev/null || true
 
 # Print section header
 print_section() {
-    echo ""
-    echo "================================================================"
-    echo "  $1"
-    echo "================================================================"
+    printf "\n"
+    printf "================================================================\n"
+    printf "  %s\n" "$1"
+    printf "================================================================\n"
 }
 
 # Print formatted status messages
 status() {
-    printf "%-60s" "$1..."
-    sync
+    printf "%-60s" "$1..." >&2
 }
 
 ok() {
-    echo " done"
-    sync
+    printf " done\n" >&2
 }
 
 info() {
-    echo "$1"
+    printf "%s\n" "$1"
 }
 
 print_section "Starting system hardening process"
@@ -952,8 +949,8 @@ fi
 if [ -d /boot/loader ]; then
     chmod 700 /boot/loader 2>/dev/null || true
 fi
-
 ok
 
+print_section "System hardening complete"
+
 exit 0
-'
