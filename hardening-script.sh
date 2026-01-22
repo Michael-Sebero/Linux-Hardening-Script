@@ -1,39 +1,5 @@
 #!/bin/bash
 su -c '
-# ========================================================
-# System Hardening Script for Linux
-# Configured for gaming workstation with P2P and development
-# ========================================================
-#
-#   - /etc/aide.conf                        (intrusion detection)
-#   - /etc/bash.bashrc                      (bash environment)
-#   - /etc/crypttab                         (encrypted partitions)
-#   - /etc/default/passwd                   (password hashing)
-#   - /etc/dhclient.conf                    (DHCP client security)
-#   - /etc/environment                      (system environment)
-#   - /etc/hardening-wrapper.conf           (build hardening)
-#   - /etc/iptables/iptables.rules          (IPv4 firewall)
-#   - /etc/iptables/ip6tables.rules         (IPv6 firewall)
-#   - /etc/issue                            (login banner)
-#   - /etc/issue.net                        (network login banner)
-#   - /etc/locale.conf                      (locale settings)
-#   - /etc/locale.gen                       (locale generation)
-#   - /etc/makepkg.conf                     (package build config)
-#   - /etc/modprobe.d/blacklist-firewire    (disable firewire)
-#   - /etc/modprobe.d/blacklist-usb.conf    (disable USB storage)
-#   - /etc/modprobe.d/uncommon-filesystems  (disable unused FS)
-#   - /etc/modprobe.d/uncommon-protocols    (disable unused protocols)
-#   - /etc/profile                          (system profile)
-#   - /etc/profile.d/bash_history.sh        (bash history config)
-#   - /etc/securetty                        (secure terminals)
-#   - /etc/shells                           (valid shells)
-#   - /etc/ssh/ssh_config                   (SSH client config)
-#   - /etc/vconsole.conf                    (console settings)
-#   - /etc/conf.d/wireless-regdom           (wireless region)
-#   - /etc/wpa_supplicant/wpa_supplicant.conf (WPA config)
-#   - /usr/lib/hardening-wrapper/*          (compiler hardening)
-#
-# ========================================================
 
 set -e
 
@@ -730,14 +696,6 @@ initial-interval 2;
 #    domain-name, domain-name-servers, host-name;
 #  require subnet-mask, domain-name-servers;
 #}
-EOF
-ok
-
-status "blacklisting USB storage"
-cat > /etc/modprobe.d/blacklist-usb.conf <<'EOF'
-# Disable USB storage for security
-# Comment out if you need USB storage devices
-blacklist usb-storage
 EOF
 ok
 
