@@ -5,7 +5,6 @@ su -c '
 # Configured for gaming workstation with P2P and development
 # ========================================================
 #
-# Integrated Configuration Files:
 #   - /etc/aide.conf                        (intrusion detection)
 #   - /etc/bash.bashrc                      (bash environment)
 #   - /etc/crypttab                         (encrypted partitions)
