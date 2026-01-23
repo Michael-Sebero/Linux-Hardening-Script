@@ -1,5 +1,7 @@
 #!/bin/bash
 
+### UNIVERSAL VERSION
+
 # Force unbuffered output for immediate visibility
 export PYTHONUNBUFFERED=1
 stty -icanon min 1 time 0 2>/dev/null || true
