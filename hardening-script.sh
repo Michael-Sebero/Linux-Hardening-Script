@@ -4,6 +4,14 @@
 export PYTHONUNBUFFERED=1
 stty -icanon min 1 time 0 2>/dev/null || true
 
+# Detect distribution
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    DISTRO="$ID"
+else
+    DISTRO="unknown"
+fi
+
 # Print section header
 print_section() {
     printf "\n"
@@ -25,7 +33,7 @@ info() {
     printf "%s\n" "$1"
 }
 
-print_section "Starting system hardening process"
+print_section "Starting system hardening process (Distribution: $DISTRO)"
 
 # ========================================================
 # FILE PERMISSIONS
@@ -36,9 +44,9 @@ status "setting secure file permissions"
 chmod 700 /root
 chmod 600 /etc/shadow /etc/gshadow
 chmod 644 /etc/passwd /etc/group
-chmod 600 /etc/sudoers
+chmod 600 /etc/sudoers 2>/dev/null || true
 chmod -R 700 /etc/ssl/private 2>/dev/null || true
-chmod -R 755 /etc/ssl/certs
+chmod -R 755 /etc/ssl/certs 2>/dev/null || true
 find /etc/cron.* -type f -exec chmod 0700 {} \; 2>/dev/null || true
 chmod 0600 /etc/crontab 2>/dev/null || true
 chmod 0600 /etc/ssh/sshd_config 2>/dev/null || true
@@ -142,181 +150,193 @@ for i in /proc/sys/net/ipv4/conf/*/bootp_relay; do echo 0 > "$i" 2>/dev/null || 
 ok
 
 # ========================================================
-# IPTABLES FIREWALL CONFIGURATION
+# IPTABLES FIREWALL CONFIGURATION (ARCH ONLY)
 # ========================================================
-print_section "Iptables Firewall Configuration"
+if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
+    print_section "Iptables Firewall Configuration"
 
-IPTABLES="/sbin/iptables"
-SSHPORT="22"
+    IPTABLES="/sbin/iptables"
+    SSHPORT="22"
 
-status "flushing existing iptables rules"
-"$IPTABLES" -F
-"$IPTABLES" -X
-"$IPTABLES" -Z
-"$IPTABLES" -t nat -F
-"$IPTABLES" -t nat -X
-"$IPTABLES" -t nat -Z
-"$IPTABLES" -t mangle -F
-"$IPTABLES" -t mangle -X
-"$IPTABLES" -t mangle -Z
-ok
+    status "flushing existing iptables rules"
+    "$IPTABLES" -F
+    "$IPTABLES" -X
+    "$IPTABLES" -Z
+    "$IPTABLES" -t nat -F
+    "$IPTABLES" -t nat -X
+    "$IPTABLES" -t nat -Z
+    "$IPTABLES" -t mangle -F
+    "$IPTABLES" -t mangle -X
+    "$IPTABLES" -t mangle -Z
+    ok
 
-status "setting default policies"
-"$IPTABLES" -P INPUT DROP
-"$IPTABLES" -P FORWARD DROP
-"$IPTABLES" -P OUTPUT ACCEPT
-"$IPTABLES" -t nat -P PREROUTING ACCEPT
-"$IPTABLES" -t nat -P OUTPUT ACCEPT
-"$IPTABLES" -t nat -P POSTROUTING ACCEPT
-"$IPTABLES" -t mangle -P PREROUTING ACCEPT
-"$IPTABLES" -t mangle -P INPUT ACCEPT
-"$IPTABLES" -t mangle -P FORWARD ACCEPT
-"$IPTABLES" -t mangle -P OUTPUT ACCEPT
-"$IPTABLES" -t mangle -P POSTROUTING ACCEPT
-ok
+    status "setting default policies"
+    "$IPTABLES" -P INPUT DROP
+    "$IPTABLES" -P FORWARD DROP
+    "$IPTABLES" -P OUTPUT ACCEPT
+    "$IPTABLES" -t nat -P PREROUTING ACCEPT
+    "$IPTABLES" -t nat -P OUTPUT ACCEPT
+    "$IPTABLES" -t nat -P POSTROUTING ACCEPT
+    "$IPTABLES" -t mangle -P PREROUTING ACCEPT
+    "$IPTABLES" -t mangle -P INPUT ACCEPT
+    "$IPTABLES" -t mangle -P FORWARD ACCEPT
+    "$IPTABLES" -t mangle -P OUTPUT ACCEPT
+    "$IPTABLES" -t mangle -P POSTROUTING ACCEPT
+    ok
 
-status "creating logging chains"
-LOG="LOG --log-level debug --log-tcp-sequence --log-tcp-options --log-ip-options"
-RLIMIT="-m limit --limit 3/s --limit-burst 8"
+    status "creating logging chains"
+    LOG="LOG --log-level debug --log-tcp-sequence --log-tcp-options --log-ip-options"
+    RLIMIT="-m limit --limit 3/s --limit-burst 8"
 
-"$IPTABLES" -N LOGACCEPT
-"$IPTABLES" -A LOGACCEPT -j $LOG $RLIMIT --log-prefix "ACCEPT "
-"$IPTABLES" -A LOGACCEPT -j ACCEPT
+    "$IPTABLES" -N LOGACCEPT
+    "$IPTABLES" -A LOGACCEPT -j $LOG $RLIMIT --log-prefix "ACCEPT "
+    "$IPTABLES" -A LOGACCEPT -j ACCEPT
 
-"$IPTABLES" -N LOGDROP
-"$IPTABLES" -A LOGDROP -j $LOG $RLIMIT --log-prefix "DROP "
-"$IPTABLES" -A LOGDROP -j DROP
+    "$IPTABLES" -N LOGDROP
+    "$IPTABLES" -A LOGDROP -j $LOG $RLIMIT --log-prefix "DROP "
+    "$IPTABLES" -A LOGDROP -j DROP
 
-"$IPTABLES" -N LOGREJECT
-"$IPTABLES" -A LOGREJECT -j $LOG $RLIMIT --log-prefix "REJECT "
-"$IPTABLES" -A LOGREJECT -p tcp -j REJECT --reject-with tcp-reset
-"$IPTABLES" -A LOGREJECT -j REJECT
-ok
+    "$IPTABLES" -N LOGREJECT
+    "$IPTABLES" -A LOGREJECT -j $LOG $RLIMIT --log-prefix "REJECT "
+    "$IPTABLES" -A LOGREJECT -p tcp -j REJECT --reject-with tcp-reset
+    "$IPTABLES" -A LOGREJECT -j REJECT
+    ok
 
-status "configuring loopback interface"
-"$IPTABLES" -A INPUT -i lo -j ACCEPT
-"$IPTABLES" -A OUTPUT -o lo -j ACCEPT
-ok
+    status "configuring loopback interface"
+    "$IPTABLES" -A INPUT -i lo -j ACCEPT
+    "$IPTABLES" -A OUTPUT -o lo -j ACCEPT
+    ok
 
-status "configuring stateful firewall"
-"$IPTABLES" -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-"$IPTABLES" -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-ok
+    status "configuring stateful firewall"
+    "$IPTABLES" -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    "$IPTABLES" -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    ok
 
-status "blocking invalid packets"
-"$IPTABLES" -A INPUT -m conntrack --ctstate INVALID -j DROP
-"$IPTABLES" -A INPUT -p tcp --tcp-flags ALL NONE -j DROP
-"$IPTABLES" -A INPUT -p tcp --tcp-flags ALL ALL -j DROP
-"$IPTABLES" -A INPUT -p tcp ! --syn -m conntrack --ctstate NEW -j DROP
-ok
+    status "blocking invalid packets"
+    "$IPTABLES" -A INPUT -m conntrack --ctstate INVALID -j DROP
+    "$IPTABLES" -A INPUT -p tcp --tcp-flags ALL NONE -j DROP
+    "$IPTABLES" -A INPUT -p tcp --tcp-flags ALL ALL -j DROP
+    "$IPTABLES" -A INPUT -p tcp ! --syn -m conntrack --ctstate NEW -j DROP
+    ok
 
-status "rate limiting ICMP"
-"$IPTABLES" -A INPUT -p icmp -m limit --limit 1/s --limit-burst 2 -j ACCEPT
-"$IPTABLES" -A INPUT -p icmp -j DROP
-"$IPTABLES" -A OUTPUT -p icmp -j ACCEPT
-ok
+    status "rate limiting ICMP"
+    "$IPTABLES" -A INPUT -p icmp -m limit --limit 1/s --limit-burst 2 -j ACCEPT
+    "$IPTABLES" -A INPUT -p icmp -j DROP
+    "$IPTABLES" -A OUTPUT -p icmp -j ACCEPT
+    ok
 
-status "allowing DNS queries"
-"$IPTABLES" -A OUTPUT -p udp --dport 53 -m conntrack --ctstate NEW -j ACCEPT
-"$IPTABLES" -A OUTPUT -p tcp --dport 53 -m conntrack --ctstate NEW -j ACCEPT
-ok
+    status "allowing DNS queries"
+    "$IPTABLES" -A OUTPUT -p udp --dport 53 -m conntrack --ctstate NEW -j ACCEPT
+    "$IPTABLES" -A OUTPUT -p tcp --dport 53 -m conntrack --ctstate NEW -j ACCEPT
+    ok
 
-status "allowing HTTP/HTTPS"
-"$IPTABLES" -A INPUT -p tcp --dport 80 -m conntrack --ctstate NEW -j ACCEPT
-"$IPTABLES" -A INPUT -p tcp --dport 443 -m conntrack --ctstate NEW -j ACCEPT
-"$IPTABLES" -A OUTPUT -p tcp --dport 80 -m conntrack --ctstate NEW -j ACCEPT
-"$IPTABLES" -A OUTPUT -p tcp --dport 443 -m conntrack --ctstate NEW -j ACCEPT
-ok
+    status "allowing HTTP/HTTPS"
+    "$IPTABLES" -A INPUT -p tcp --dport 80 -m conntrack --ctstate NEW -j ACCEPT
+    "$IPTABLES" -A INPUT -p tcp --dport 443 -m conntrack --ctstate NEW -j ACCEPT
+    "$IPTABLES" -A OUTPUT -p tcp --dport 80 -m conntrack --ctstate NEW -j ACCEPT
+    "$IPTABLES" -A OUTPUT -p tcp --dport 443 -m conntrack --ctstate NEW -j ACCEPT
+    ok
 
-status "allowing SSH with brute-force protection"
-"$IPTABLES" -A INPUT -p tcp --dport "$SSHPORT" -m conntrack --ctstate NEW -m recent --set --name SSH
-"$IPTABLES" -A INPUT -p tcp --dport "$SSHPORT" -m conntrack --ctstate NEW -m recent --update --seconds 60 --hitcount 4 --name SSH -j DROP
-"$IPTABLES" -A INPUT -p tcp --dport "$SSHPORT" -m conntrack --ctstate NEW -j ACCEPT
-"$IPTABLES" -A OUTPUT -p tcp --dport "$SSHPORT" -m conntrack --ctstate NEW -j ACCEPT
-ok
+    status "allowing SSH with brute-force protection"
+    "$IPTABLES" -A INPUT -p tcp --dport "$SSHPORT" -m conntrack --ctstate NEW -m recent --set --name SSH
+    "$IPTABLES" -A INPUT -p tcp --dport "$SSHPORT" -m conntrack --ctstate NEW -m recent --update --seconds 60 --hitcount 4 --name SSH -j DROP
+    "$IPTABLES" -A INPUT -p tcp --dport "$SSHPORT" -m conntrack --ctstate NEW -j ACCEPT
+    "$IPTABLES" -A OUTPUT -p tcp --dport "$SSHPORT" -m conntrack --ctstate NEW -j ACCEPT
+    ok
 
-status "allowing email protocols"
-"$IPTABLES" -A OUTPUT -p tcp --dport 587 -m conntrack --ctstate NEW -j ACCEPT  # SMTP submission
-"$IPTABLES" -A OUTPUT -p tcp --dport 995 -m conntrack --ctstate NEW -j ACCEPT  # POP3S
-"$IPTABLES" -A OUTPUT -p tcp --dport 993 -m conntrack --ctstate NEW -j ACCEPT  # IMAPS
-ok
+    status "allowing email protocols"
+    "$IPTABLES" -A OUTPUT -p tcp --dport 587 -m conntrack --ctstate NEW -j ACCEPT  # SMTP submission
+    "$IPTABLES" -A OUTPUT -p tcp --dport 995 -m conntrack --ctstate NEW -j ACCEPT  # POP3S
+    "$IPTABLES" -A OUTPUT -p tcp --dport 993 -m conntrack --ctstate NEW -j ACCEPT  # IMAPS
+    ok
 
-status "allowing Git protocols"
-"$IPTABLES" -A OUTPUT -p tcp --dport 9418 -m conntrack --ctstate NEW -j ACCEPT  # Git protocol
-ok
+    status "allowing Git protocols"
+    "$IPTABLES" -A OUTPUT -p tcp --dport 9418 -m conntrack --ctstate NEW -j ACCEPT  # Git protocol
+    ok
 
-status "allowing Tor network"
-"$IPTABLES" -A INPUT -p tcp -m multiport --dports 9050,9051,9150 -j ACCEPT
-"$IPTABLES" -A OUTPUT -p tcp -m multiport --dports 9050,9051,9150 -j ACCEPT
-ok
+    status "allowing Tor network"
+    "$IPTABLES" -A INPUT -p tcp -m multiport --dports 9050,9051,9150 -j ACCEPT
+    "$IPTABLES" -A OUTPUT -p tcp -m multiport --dports 9050,9051,9150 -j ACCEPT
+    ok
 
-status "allowing BitTorrent (P2P)"
-"$IPTABLES" -A INPUT -p tcp --dport 6881:6889 -j ACCEPT
-"$IPTABLES" -A INPUT -p udp --dport 6881:6889 -j ACCEPT
-ok
+    status "allowing BitTorrent (P2P)"
+    "$IPTABLES" -A INPUT -p tcp --dport 6881:6889 -j ACCEPT
+    "$IPTABLES" -A INPUT -p udp --dport 6881:6889 -j ACCEPT
+    ok
 
-status "allowing Steam gaming"
-"$IPTABLES" -A INPUT -p tcp --dport 27000:27100 -j ACCEPT
-"$IPTABLES" -A INPUT -p udp --dport 27000:27100 -j ACCEPT
-ok
+    status "allowing Steam gaming"
+    "$IPTABLES" -A INPUT -p tcp --dport 27000:27100 -j ACCEPT
+    "$IPTABLES" -A INPUT -p udp --dport 27000:27100 -j ACCEPT
+    ok
 
-status "allowing console gaming (PlayStation/Xbox)"
-"$IPTABLES" -A INPUT -p tcp --dport 3478:3480 -j ACCEPT
-"$IPTABLES" -A INPUT -p udp --dport 3478:3480 -j ACCEPT
-ok
+    status "allowing console gaming (PlayStation/Xbox)"
+    "$IPTABLES" -A INPUT -p tcp --dport 3478:3480 -j ACCEPT
+    "$IPTABLES" -A INPUT -p udp --dport 3478:3480 -j ACCEPT
+    ok
 
-status "allowing Discord voice"
-"$IPTABLES" -A INPUT -p udp --dport 50000:65535 -j ACCEPT
-"$IPTABLES" -A OUTPUT -p udp --dport 50000:65535 -j ACCEPT
-ok
+    status "allowing Discord voice"
+    "$IPTABLES" -A INPUT -p udp --dport 50000:65535 -j ACCEPT
+    "$IPTABLES" -A OUTPUT -p udp --dport 50000:65535 -j ACCEPT
+    ok
 
-status "implementing SYN flood protection"
-"$IPTABLES" -A INPUT -p tcp --syn -m limit --limit 1/s --limit-burst 3 -j ACCEPT
-"$IPTABLES" -A INPUT -p tcp --syn -j DROP
-ok
+    status "implementing SYN flood protection"
+    "$IPTABLES" -A INPUT -p tcp --syn -m limit --limit 1/s --limit-burst 3 -j ACCEPT
+    "$IPTABLES" -A INPUT -p tcp --syn -j DROP
+    ok
 
-status "logging dropped packets"
-"$IPTABLES" -A INPUT -m limit --limit 5/min -j LOG --log-prefix "iptables-input: " --log-level 7
-"$IPTABLES" -A FORWARD -m limit --limit 5/min -j LOG --log-prefix "iptables-forward: " --log-level 7
-ok
+    status "logging dropped packets"
+    "$IPTABLES" -A INPUT -m limit --limit 5/min -j LOG --log-prefix "iptables-input: " --log-level 7
+    "$IPTABLES" -A FORWARD -m limit --limit 5/min -j LOG --log-prefix "iptables-forward: " --log-level 7
+    ok
 
-status "setting final drop rules"
-"$IPTABLES" -A INPUT -j LOGREJECT
-"$IPTABLES" -A FORWARD -j LOGREJECT
-ok
+    status "setting final drop rules"
+    "$IPTABLES" -A INPUT -j LOGREJECT
+    "$IPTABLES" -A FORWARD -j LOGREJECT
+    ok
 
-status "saving iptables rules"
-mkdir -p /etc/iptables
-iptables-save > /etc/iptables/iptables.rules
-ok
+    status "saving iptables rules"
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/iptables.rules
+    ok
 
-# ========================================================
-# IPv6 FIREWALL
-# ========================================================
-print_section "IPv6 Firewall (Block All)"
+    # ========================================================
+    # IPv6 FIREWALL
+    # ========================================================
+    print_section "IPv6 Firewall (Block All)"
 
-IP6TABLES="/sbin/ip6tables"
+    IP6TABLES="/sbin/ip6tables"
 
-status "configuring ip6tables (block all)"
-"$IP6TABLES" -F
-"$IP6TABLES" -X
-"$IP6TABLES" -Z
-"$IP6TABLES" -P INPUT DROP
-"$IP6TABLES" -P FORWARD DROP
-"$IP6TABLES" -P OUTPUT DROP
-"$IP6TABLES" -A INPUT -m limit --limit 5/min -j LOG --log-prefix "ip6tables-input: " --log-level 7
-"$IP6TABLES" -A FORWARD -m limit --limit 5/min -j LOG --log-prefix "ip6tables-forward: " --log-level 7
-"$IP6TABLES" -A OUTPUT -m limit --limit 5/min -j LOG --log-prefix "ip6tables-output: " --log-level 7
-ip6tables-save > /etc/iptables/ip6tables.rules
-ok
+    status "configuring ip6tables (block all)"
+    "$IP6TABLES" -F
+    "$IP6TABLES" -X
+    "$IP6TABLES" -Z
+    "$IP6TABLES" -P INPUT DROP
+    "$IP6TABLES" -P FORWARD DROP
+    "$IP6TABLES" -P OUTPUT DROP
+    "$IP6TABLES" -A INPUT -m limit --limit 5/min -j LOG --log-prefix "ip6tables-input: " --log-level 7
+    "$IP6TABLES" -A FORWARD -m limit --limit 5/min -j LOG --log-prefix "ip6tables-forward: " --log-level 7
+    "$IP6TABLES" -A OUTPUT -m limit --limit 5/min -j LOG --log-prefix "ip6tables-output: " --log-level 7
+    ip6tables-save > /etc/iptables/ip6tables.rules
+    ok
+else
+    print_section "Firewall Configuration (Skipping iptables - use UFW on Debian/Mint)"
+    info "For Debian/Mint systems, please use UFW (Uncomplicated Firewall) instead:"
+    info "  sudo ufw enable"
+    info "  sudo ufw default deny incoming"
+    info "  sudo ufw default allow outgoing"
+    info "  sudo ufw allow 22/tcp  # SSH"
+    info "  sudo ufw status"
+fi
 
 # ========================================================
 # SYSTEM CONFIGURATION FILES
 # ========================================================
 print_section "System Configuration Files"
 
-status "configuring bash environment"
-cat > /etc/bash.bashrc <<'EOF'
+# Only configure bash.bashrc on Arch - Debian/Mint manage this themselves
+if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
+    status "configuring bash environment"
+    cat > /etc/bash.bashrc <<'EOF'
 # /etc/bash.bashrc
 
 [[ $- != *i* ]] && return
@@ -343,10 +363,16 @@ esac
 
 [ -r /usr/share/bash-completion/bash_completion ] && . /usr/share/bash-completion/bash_completion
 EOF
-ok
+    ok
+else
+    status "skipping bash.bashrc (managed by distribution)"
+    ok
+fi
 
-status "configuring global profile"
-cat > /etc/profile <<'EOF'
+# Only configure /etc/profile on Arch
+if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
+    status "configuring global profile"
+    cat > /etc/profile <<'EOF'
 # /etc/profile
 
 umask 0027
@@ -378,7 +404,11 @@ export TMOUT
 unset TERMCAP
 unset MANPATH
 EOF
-ok
+    ok
+else
+    status "skipping /etc/profile (managed by distribution)"
+    ok
+fi
 
 status "configuring bash history"
 cat > /etc/profile.d/bash_history.sh <<'EOF'
@@ -392,6 +422,7 @@ EOF
 chmod +x /etc/profile.d/bash_history.sh
 ok
 
+# Locale configuration - safe for all distributions
 status "configuring locale settings"
 cat > /etc/locale.conf <<'EOF'
 LANG=en_GB.UTF-8
@@ -418,11 +449,14 @@ PAGER="less"
 EOF
 ok
 
-status "configuring console settings"
-cat > /etc/vconsole.conf <<'EOF'
+# Console settings - primarily for Arch
+if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
+    status "configuring console settings"
+    cat > /etc/vconsole.conf <<'EOF'
 KEYMAP=uk
 EOF
-ok
+    ok
+fi
 
 status "configuring secure terminals"
 cat > /etc/securetty <<'EOF'
@@ -658,8 +692,10 @@ chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
 ok
 
 status "restricting su to wheel group"
-if ! grep -q "auth required pam_wheel.so" /etc/pam.d/su 2>/dev/null; then
-  echo "auth required pam_wheel.so use_uid" >> /etc/pam.d/su
+if [ -f /etc/pam.d/su ]; then
+    if ! grep -q "auth required pam_wheel.so" /etc/pam.d/su 2>/dev/null; then
+      echo "auth required pam_wheel.so use_uid" >> /etc/pam.d/su
+    fi
 fi
 ok
 
@@ -722,8 +758,10 @@ initial-interval 2;
 EOF
 ok
 
-status "configuring build hardening (makepkg)"
-cat > /etc/makepkg.conf <<'EOF'
+# Only configure makepkg on Arch
+if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
+    status "configuring build hardening (makepkg)"
+    cat > /etc/makepkg.conf <<'EOF'
 # /etc/makepkg.conf
 
 DLAGENTS=('ftp::/usr/bin/curl -fC - --ftp-pasv --retry 3 --retry-delay 3 -o %o %u'
@@ -763,7 +801,11 @@ PURGE_TARGETS=(usr/{,share}/info/dir .packlist *.pod)
 PKGEXT='.pkg.tar.xz'
 SRCEXT='.src.tar.gz'
 EOF
-ok
+    ok
+else
+    status "skipping makepkg.conf (Arch-specific)"
+    ok
+fi
 
 # ========================================================
 # SSH CLIENT CONFIGURATION
@@ -784,7 +826,7 @@ Host *
   AddressFamily any
   ConnectTimeout 180
   HashKnownHosts yes
-  StrictHostKeyChecking yes
+  StrictHostKeyChecking ask
   IdentityFile ~/.ssh/id_ed25519
   IdentityFile ~/.ssh/id_rsa
   Port 22
@@ -912,8 +954,8 @@ print_section "Final File Permissions"
 status "setting final file permissions"
 chmod 600 /etc/ssh/ssh_config
 chmod 600 /etc/aide.conf 2>/dev/null || true
-chmod 644 /etc/profile
-chmod 644 /etc/bash.bashrc
+chmod 644 /etc/profile 2>/dev/null || true
+chmod 644 /etc/bash.bashrc 2>/dev/null || true
 chmod 644 /etc/environment
 chmod 644 /etc/locale.conf
 chmod 644 /etc/locale.gen
@@ -922,8 +964,9 @@ chmod 600 /etc/dhclient.conf
 chmod 600 /etc/default/passwd
 chmod 644 /etc/hardening-wrapper.conf
 chmod 644 /etc/issue /etc/issue.net
-chmod 644 /etc/shells /etc/securetty /etc/vconsole.conf
-chmod 644 /etc/makepkg.conf
+chmod 644 /etc/shells /etc/securetty
+chmod 644 /etc/vconsole.conf 2>/dev/null || true
+chmod 644 /etc/makepkg.conf 2>/dev/null || true
 chmod 644 /etc/conf.d/wireless-regdom
 chmod 644 /etc/hosts
 chmod 644 /etc/hostname
@@ -942,7 +985,7 @@ if [ -f /boot/grub/grub.cfg ]; then
     chmod 600 /boot/grub/grub.cfg
     chown root:root /boot/grub/grub.cfg
 fi
-if [ -d /boot/grub2 ]; then
+if [ -d /boot/grub2 ] && [ -f /boot/grub2/grub.cfg ]; then
     chmod 600 /boot/grub2/grub.cfg 2>/dev/null || true
     chown root:root /boot/grub2/grub.cfg 2>/dev/null || true
 fi
