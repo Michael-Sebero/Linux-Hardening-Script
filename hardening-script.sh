@@ -410,8 +410,10 @@ else
     ok
 fi
 
-status "configuring bash history"
-cat > /etc/profile.d/bash_history.sh <<'EOF'
+# Only configure bash history with readonly on Arch
+if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
+    status "configuring bash history (with readonly)"
+    cat > /etc/profile.d/bash_history.sh <<'EOF'
 export HISTTIMEFORMAT="%F %T "
 export HISTCONTROL=ignoredups
 export HISTSIZE=1000
@@ -419,12 +421,23 @@ readonly HISTSIZE
 readonly HISTFILE
 readonly HISTFILESIZE
 EOF
-chmod +x /etc/profile.d/bash_history.sh
-ok
+    chmod +x /etc/profile.d/bash_history.sh
+    ok
+else
+    status "configuring bash history (without readonly)"
+    cat > /etc/profile.d/bash_history.sh <<'EOF'
+export HISTTIMEFORMAT="%F %T "
+export HISTCONTROL=ignoredups
+export HISTSIZE=1000
+EOF
+    chmod +x /etc/profile.d/bash_history.sh
+    ok
+fi
 
-# Locale configuration - safe for all distributions
-status "configuring locale settings"
-cat > /etc/locale.conf <<'EOF'
+# Locale configuration - Arch uses /etc/locale.conf, Debian uses /etc/default/locale
+if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
+    status "configuring locale settings"
+    cat > /etc/locale.conf <<'EOF'
 LANG=en_GB.UTF-8
 LANGUAGE="en_GB:en_US"
 LC_CTYPE="C"
@@ -439,15 +452,25 @@ LC_TELEPHONE="C"
 LC_MEASUREMENT="C"
 LC_IDENTIFICATION="C"
 EOF
-ok
+    ok
+else
+    status "skipping /etc/locale.conf (Debian uses /etc/default/locale)"
+    ok
+fi
 
-status "configuring environment"
-cat > /etc/environment <<'EOF'
+# Only configure /etc/environment on Arch
+if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
+    status "configuring environment"
+    cat > /etc/environment <<'EOF'
 LANG="en_GB.UTF-8"
 LANGUAGE="en_GB:en_US"
 PAGER="less"
 EOF
-ok
+    ok
+else
+    status "skipping /etc/environment (managed by distribution)"
+    ok
+fi
 
 # Console settings - primarily for Arch
 if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
@@ -472,18 +495,26 @@ hvc0
 EOF
 ok
 
-status "configuring valid shells"
-cat > /etc/shells <<'EOF'
+# Only configure /etc/shells on Arch - Debian manages this automatically
+if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
+    status "configuring valid shells"
+    cat > /etc/shells <<'EOF'
 /bin/sh
 /bin/bash
 /bin/rbash
 /bin/zsh
 /bin/rzsh
 EOF
-ok
+    ok
+else
+    status "skipping /etc/shells (managed by distribution)"
+    ok
+fi
 
-status "configuring password hashing"
-cat > /etc/default/passwd <<'EOF'
+# Only configure password hashing on Arch
+if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
+    status "configuring password hashing"
+    cat > /etc/default/passwd <<'EOF'
 CRYPT=sha512
 GROUP_CRYPT=blowfish
 CRYPT_FILES=blowfish
@@ -493,10 +524,16 @@ BLOWFISH_CRYPT_FILES=10
 sha256/sha512: 9999-9999999
 SHA512_CRYPT_FILES=10000
 EOF
-ok
+    ok
+else
+    status "skipping password hashing config (managed by distribution)"
+    ok
+fi
 
-status "configuring hardening wrapper"
-cat > /etc/hardening-wrapper.conf <<'EOF'
+# Only configure hardening wrapper on Arch
+if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
+    status "configuring hardening wrapper"
+    cat > /etc/hardening-wrapper.conf <<'EOF'
 HARDENING_BINDNOW=1
 HARDENING_PIE=1
 HARDENING_FORTIFY=2
@@ -505,8 +542,8 @@ HARDENING_STACK_CHECK=1
 HARDENING_STACK_PROTECTOR=3
 EOF
 
-# Create hardening wrapper scripts
-mkdir -p /usr/lib/hardening-wrapper
+    # Create hardening wrapper scripts
+    mkdir -p /usr/lib/hardening-wrapper
 
 cat > /usr/lib/hardening-wrapper/common.sh <<'EOF'
 error() {
@@ -647,21 +684,33 @@ EOF
 chmod +x /usr/lib/hardening-wrapper/common.sh
 chmod +x /usr/lib/hardening-wrapper/cc-wrapper.sh
 chmod +x /usr/lib/hardening-wrapper/ld-wrapper.sh
-ok
+    ok
+else
+    status "skipping hardening wrapper (Arch-specific)"
+    ok
+fi
 
-status "configuring wireless regulatory domain"
-cat > /etc/conf.d/wireless-regdom <<'EOF'
+# Only configure wireless regdom on Arch
+if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
+    status "configuring wireless regulatory domain"
+    cat > /etc/conf.d/wireless-regdom <<'EOF'
 # Wireless regulatory domain configuration
 # Uncomment your region
 WIRELESS_REGDOM="00"
 #WIRELESS_REGDOM="GB"
 #WIRELESS_REGDOM="US"
 EOF
-ok
+    ok
+else
+    status "skipping wireless-regdom (Arch-specific)"
+    ok
+fi
 
-status "configuring WPA supplicant"
-mkdir -p /etc/wpa_supplicant
-cat > /etc/wpa_supplicant/wpa_supplicant.conf <<'EOF'
+# Only configure WPA supplicant on Arch - Debian uses NetworkManager
+if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
+    status "configuring WPA supplicant"
+    mkdir -p /etc/wpa_supplicant
+    cat > /etc/wpa_supplicant/wpa_supplicant.conf <<'EOF'
 # WPA supplicant configuration
 # NOTE: This file may contain password information and should be
 # readable only by root on multiuser systems.
@@ -688,8 +737,12 @@ country=GB
 #  priority=5
 #}
 EOF
-chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
-ok
+    chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
+    ok
+else
+    status "skipping WPA supplicant (Debian uses NetworkManager)"
+    ok
+fi
 
 status "restricting su to wheel group"
 if [ -f /etc/pam.d/su ]; then
@@ -710,14 +763,20 @@ EOF
 cp /etc/issue /etc/issue.net
 ok
 
-status "configuring locale generation"
-cat > /etc/locale.gen <<'EOF'
+# Only configure locale.gen on Arch - Debian manages locales via dpkg-reconfigure
+if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
+    status "configuring locale generation"
+    cat > /etc/locale.gen <<'EOF'
 en_GB.UTF-8 UTF-8  
 en_GB ISO-8859-1  
 en_US.UTF-8 UTF-8  
 en_US ISO-8859-1  
 EOF
-ok
+    ok
+else
+    status "skipping /etc/locale.gen (managed by distribution)"
+    ok
+fi
 
 status "configuring encrypted partitions"
 cat > /etc/crypttab <<'EOF'
@@ -962,21 +1021,22 @@ chmod 600 /etc/ssh/ssh_config
 chmod 600 /etc/aide.conf 2>/dev/null || true
 chmod 644 /etc/profile 2>/dev/null || true
 chmod 644 /etc/bash.bashrc 2>/dev/null || true
-chmod 644 /etc/environment
-chmod 644 /etc/locale.conf
-chmod 644 /etc/locale.gen
-chmod 600 /etc/crypttab
-chmod 600 /etc/dhclient.conf
-chmod 600 /etc/default/passwd
-chmod 644 /etc/hardening-wrapper.conf
+chmod 644 /etc/environment 2>/dev/null || true
+chmod 644 /etc/locale.conf 2>/dev/null || true
+chmod 644 /etc/locale.gen 2>/dev/null || true
+chmod 600 /etc/crypttab 2>/dev/null || true
+chmod 600 /etc/dhclient.conf 2>/dev/null || true
+chmod 600 /etc/default/passwd 2>/dev/null || true
+chmod 644 /etc/hardening-wrapper.conf 2>/dev/null || true
 chmod 644 /etc/issue /etc/issue.net
-chmod 644 /etc/shells /etc/securetty
+chmod 644 /etc/shells 2>/dev/null || true
+chmod 644 /etc/securetty
 chmod 644 /etc/vconsole.conf 2>/dev/null || true
 chmod 644 /etc/makepkg.conf 2>/dev/null || true
-chmod 644 /etc/conf.d/wireless-regdom
-chmod 644 /etc/hosts
-chmod 644 /etc/hostname
-chmod 644 /etc/networks
+chmod 644 /etc/conf.d/wireless-regdom 2>/dev/null || true
+chmod 644 /etc/hosts 2>/dev/null || true
+chmod 644 /etc/hostname 2>/dev/null || true
+chmod 644 /etc/networks 2>/dev/null || true
 chmod 600 /etc/security/access.conf 2>/dev/null || true
 chmod 600 /etc/security/limits.conf 2>/dev/null || true
 chmod 700 /root/.ssh 2>/dev/null || true
