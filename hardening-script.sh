@@ -914,13 +914,19 @@ ok
 # MISC
 # ========================================================
 
-status "configuring stricter default umask"
-cat > /etc/profile.d/umask.sh <<'EOF'
+# Only set stricter umask on Arch/Manjaro
+if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
+    status "configuring stricter default umask"
+    cat > /etc/profile.d/umask.sh <<'EOF'
 # Set stricter umask for security
 umask 027
 EOF
-chmod +x /etc/profile.d/umask.sh
-ok
+    chmod +x /etc/profile.d/umask.sh
+    ok
+else
+    status "skipping stricter umask (using distribution defaults)"
+    ok
+fi
 
 status "restricting cron and at access"
 echo "root" > /etc/cron.allow
