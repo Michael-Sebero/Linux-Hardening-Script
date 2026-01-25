@@ -4,9 +4,11 @@
 . Fail2Ban
 
 ## How to use
-. cd /directory/of/file
+```
+curl -LO https://raw.githubusercontent.com/Michael-Sebero/Hardening-Script/hardening-script.sh
 
-. sudo sh hardening script.sh
+sudo sh hardening-script.sh	
+```
 
 ## What this script references 
 https://github.com/ChrisTitusTech/secure-linux
