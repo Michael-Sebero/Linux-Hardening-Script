@@ -152,7 +152,7 @@ for i in /proc/sys/net/ipv4/conf/*/bootp_relay; do echo 0 > "$i" 2>/dev/null || 
 ok
 
 # ========================================================
-# IPTABLES FIREWALL CONFIGURATION (ARCH ONLY)
+# IPTABLES FIREWALL CONFIGURATION
 # ========================================================
 if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     print_section "Iptables Firewall Configuration"
@@ -247,13 +247,13 @@ if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     ok
 
     status "allowing email protocols"
-    "$IPTABLES" -A OUTPUT -p tcp --dport 587 -m conntrack --ctstate NEW -j ACCEPT  # SMTP submission
-    "$IPTABLES" -A OUTPUT -p tcp --dport 995 -m conntrack --ctstate NEW -j ACCEPT  # POP3S
-    "$IPTABLES" -A OUTPUT -p tcp --dport 993 -m conntrack --ctstate NEW -j ACCEPT  # IMAPS
+    "$IPTABLES" -A OUTPUT -p tcp --dport 587 -m conntrack --ctstate NEW -j ACCEPT
+    "$IPTABLES" -A OUTPUT -p tcp --dport 995 -m conntrack --ctstate NEW -j ACCEPT
+    "$IPTABLES" -A OUTPUT -p tcp --dport 993 -m conntrack --ctstate NEW -j ACCEPT
     ok
 
     status "allowing Git protocols"
-    "$IPTABLES" -A OUTPUT -p tcp --dport 9418 -m conntrack --ctstate NEW -j ACCEPT  # Git protocol
+    "$IPTABLES" -A OUTPUT -p tcp --dport 9418 -m conntrack --ctstate NEW -j ACCEPT
     ok
 
     status "allowing Tor network"
@@ -321,12 +321,12 @@ if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     ip6tables-save > /etc/iptables/ip6tables.rules
     ok
 else
-    print_section "Firewall Configuration (Skipping iptables - use UFW on Debian/Mint)"
-    info "For Debian/Mint systems, please use UFW (Uncomplicated Firewall) instead:"
+    print_section "Firewall Configuration"
+    info "For alternative firewall configuration, consider using UFW:"
     info "  sudo ufw enable"
     info "  sudo ufw default deny incoming"
     info "  sudo ufw default allow outgoing"
-    info "  sudo ufw allow 22/tcp  # SSH"
+    info "  sudo ufw allow 22/tcp"
     info "  sudo ufw status"
 fi
 
@@ -335,7 +335,6 @@ fi
 # ========================================================
 print_section "System Configuration Files"
 
-# Only configure bash.bashrc on Arch - Debian/Mint manage this themselves
 if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     status "configuring bash environment"
     cat > /etc/bash.bashrc <<'EOF'
@@ -367,11 +366,10 @@ esac
 EOF
     ok
 else
-    status "skipping bash.bashrc (managed by distribution)"
+    status "skipping bash environment configuration"
     ok
 fi
 
-# Only configure /etc/profile on Arch
 if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     status "configuring global profile"
     cat > /etc/profile <<'EOF'
@@ -408,11 +406,10 @@ unset MANPATH
 EOF
     ok
 else
-    status "skipping /etc/profile (managed by distribution)"
+    status "skipping global profile configuration"
     ok
 fi
 
-# Only configure bash history with readonly on Arch
 if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     status "configuring bash history (with readonly)"
     cat > /etc/profile.d/bash_history.sh <<'EOF'
@@ -436,7 +433,6 @@ EOF
     ok
 fi
 
-# Locale configuration - Arch uses /etc/locale.conf, Debian uses /etc/default/locale
 if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     status "configuring locale settings"
     cat > /etc/locale.conf <<'EOF'
@@ -456,11 +452,10 @@ LC_IDENTIFICATION="C"
 EOF
     ok
 else
-    status "skipping /etc/locale.conf (Debian uses /etc/default/locale)"
+    status "skipping locale configuration"
     ok
 fi
 
-# Only configure /etc/environment on Arch
 if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     status "configuring environment"
     cat > /etc/environment <<'EOF'
@@ -470,11 +465,10 @@ PAGER="less"
 EOF
     ok
 else
-    status "skipping /etc/environment (managed by distribution)"
+    status "skipping environment configuration"
     ok
 fi
 
-# Console settings - primarily for Arch
 if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     status "configuring console settings"
     cat > /etc/vconsole.conf <<'EOF'
@@ -497,7 +491,6 @@ hvc0
 EOF
 ok
 
-# Only configure /etc/shells on Arch - Debian manages this automatically
 if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     status "configuring valid shells"
     cat > /etc/shells <<'EOF'
@@ -509,11 +502,10 @@ if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
 EOF
     ok
 else
-    status "skipping /etc/shells (managed by distribution)"
+    status "skipping shell configuration"
     ok
 fi
 
-# Only configure password hashing on Arch
 if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     status "configuring password hashing"
     cat > /etc/default/passwd <<'EOF'
@@ -528,11 +520,10 @@ SHA512_CRYPT_FILES=10000
 EOF
     ok
 else
-    status "skipping password hashing config (managed by distribution)"
+    status "skipping password hashing configuration"
     ok
 fi
 
-# Only configure hardening wrapper on Arch
 if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     status "configuring hardening wrapper"
     cat > /etc/hardening-wrapper.conf <<'EOF'
@@ -544,7 +535,6 @@ HARDENING_STACK_CHECK=1
 HARDENING_STACK_PROTECTOR=3
 EOF
 
-    # Create hardening wrapper scripts
     mkdir -p /usr/lib/hardening-wrapper
 
 cat > /usr/lib/hardening-wrapper/common.sh <<'EOF'
@@ -688,11 +678,10 @@ chmod +x /usr/lib/hardening-wrapper/cc-wrapper.sh
 chmod +x /usr/lib/hardening-wrapper/ld-wrapper.sh
     ok
 else
-    status "skipping hardening wrapper (Arch-specific)"
+    status "skipping hardening wrapper configuration"
     ok
 fi
 
-# Only configure wireless regdom on Arch
 if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     status "configuring wireless regulatory domain"
     cat > /etc/conf.d/wireless-regdom <<'EOF'
@@ -704,11 +693,10 @@ WIRELESS_REGDOM="00"
 EOF
     ok
 else
-    status "skipping wireless-regdom (Arch-specific)"
+    status "skipping wireless regulatory domain configuration"
     ok
 fi
 
-# Only configure WPA supplicant on Arch - Debian uses NetworkManager
 if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     status "configuring WPA supplicant"
     mkdir -p /etc/wpa_supplicant
@@ -742,7 +730,7 @@ EOF
     chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
     ok
 else
-    status "skipping WPA supplicant (Debian uses NetworkManager)"
+    status "skipping WPA supplicant configuration"
     ok
 fi
 
@@ -765,7 +753,6 @@ EOF
 cp /etc/issue /etc/issue.net
 ok
 
-# Only configure locale.gen on Arch - Debian manages locales via dpkg-reconfigure
 if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     status "configuring locale generation"
     cat > /etc/locale.gen <<'EOF'
@@ -776,7 +763,7 @@ en_US ISO-8859-1
 EOF
     ok
 else
-    status "skipping /etc/locale.gen (managed by distribution)"
+    status "skipping locale generation configuration"
     ok
 fi
 
@@ -819,7 +806,6 @@ initial-interval 2;
 EOF
 ok
 
-# Only configure makepkg on Arch
 if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     status "configuring build hardening (makepkg)"
     cat > /etc/makepkg.conf <<'EOF'
@@ -864,7 +850,7 @@ SRCEXT='.src.tar.gz'
 EOF
     ok
 else
-    status "skipping makepkg.conf (Arch-specific)"
+    status "skipping build hardening configuration"
     ok
 fi
 
@@ -975,7 +961,6 @@ ok
 # MISC
 # ========================================================
 
-# Only set stricter umask on Arch/Manjaro
 if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     status "configuring stricter default umask"
     cat > /etc/profile.d/umask.sh <<'EOF'
@@ -985,7 +970,7 @@ EOF
     chmod +x /etc/profile.d/umask.sh
     ok
 else
-    status "skipping stricter umask (using distribution defaults)"
+    status "skipping stricter umask configuration"
     ok
 fi
 
