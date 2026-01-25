@@ -347,11 +347,8 @@ PS2='> '
 PS3='> '
 PS4='+ '
 
-readonly
 umask 0027
-
-readonly
-TMOUT=1800
+readonly TMOUT=1800
 
 case ${TERM} in
   xterm*|rxvt*|Eterm|aterm|kterm|gnome*)
@@ -382,8 +379,7 @@ if [[ $UID == 0 ]]; then
 elif [[ $UID == 1000 ]]; then
   export PATH="/usr/local/bin:/usr/bin"
 else
-  readonly 
-  export PATH="$HOME"
+  export PATH="/usr/local/bin:/usr/bin:$HOME/.local/bin"
 fi
 
 if test -d /etc/profile.d/; then
@@ -397,8 +393,7 @@ if test "$PS1" && test "$BASH" && test -z ${POSIXLY_CORRECT+x} && test -r /etc/b
   . /etc/bash.bashrc
 fi
 
-readonly
-TMOUT="1800"
+readonly TMOUT="1800"
 export TMOUT
 
 unset TERMCAP
@@ -417,7 +412,6 @@ export HISTTIMEFORMAT="%F %T "
 export HISTCONTROL=ignoredups
 export HISTSIZE=1000
 readonly HISTSIZE
-readonly HISTFILE
 readonly HISTFILESIZE
 EOF
     chmod +x /etc/profile.d/bash_history.sh
