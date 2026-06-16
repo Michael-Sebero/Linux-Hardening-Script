@@ -46,7 +46,7 @@ status "setting secure file permissions"
 chmod 700 /root
 chmod 600 /etc/shadow /etc/gshadow
 chmod 644 /etc/passwd /etc/group
-chmod 600 /etc/sudoers 2>/dev/null || true
+chmod 440 /etc/sudoers 2>/dev/null || true
 chmod -R 700 /etc/ssl/private 2>/dev/null || true
 chmod -R 755 /etc/ssl/certs 2>/dev/null || true
 find /etc/cron.* -type f -exec chmod 0700 {} \; 2>/dev/null || true
@@ -256,8 +256,7 @@ if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     "$IPTABLES" -A OUTPUT -p tcp --dport 9418 -m conntrack --ctstate NEW -j ACCEPT
     ok
 
-    status "allowing Tor network"
-    "$IPTABLES" -A INPUT -p tcp -m multiport --dports 9050,9051,9150 -j ACCEPT
+    status "allowing Tor network (outbound only)"
     "$IPTABLES" -A OUTPUT -p tcp -m multiport --dports 9050,9051,9150 -j ACCEPT
     ok
 
@@ -276,9 +275,8 @@ if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
     "$IPTABLES" -A INPUT -p udp --dport 3478:3480 -j ACCEPT
     ok
 
-    status "allowing Discord voice"
-    "$IPTABLES" -A INPUT -p udp --dport 50000:65535 -j ACCEPT
-    "$IPTABLES" -A OUTPUT -p udp --dport 50000:65535 -j ACCEPT
+    status "allowing Discord voice (outbound only)"
+    "$IPTABLES" -A OUTPUT -p udp --dport 50000:65535 -m conntrack --ctstate NEW -j ACCEPT
     ok
 
     status "implementing SYN flood protection"
@@ -411,6 +409,7 @@ if [ "$DISTRO" = "arch" ] || [ "$DISTRO" = "manjaro" ]; then
 export HISTTIMEFORMAT="%F %T "
 export HISTCONTROL=ignoredups
 export HISTSIZE=1000
+export HISTFILESIZE=2000
 readonly HISTSIZE
 readonly HISTFILESIZE
 EOF
@@ -422,6 +421,7 @@ else
 export HISTTIMEFORMAT="%F %T "
 export HISTCONTROL=ignoredups
 export HISTSIZE=1000
+export HISTFILESIZE=2000
 EOF
     chmod +x /etc/profile.d/bash_history.sh
     ok
