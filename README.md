@@ -5,9 +5,9 @@
 
 ## How to use
 ```
-curl -LO https://raw.githubusercontent.com/Michael-Sebero/Hardening-Script/hardening-script.sh
+curl -LO https://raw.githubusercontent.com/Michael-Sebero/Linux-Hardening-Script/refs/heads/master/hardening-script.sh
 
-sudo sh hardening-script.sh	
+sudo sh hardening-script.sh
 ```
 
 ## What this script references 
