@@ -186,6 +186,7 @@ MODPROBE="/sbin/modprobe"
 ok
 
 status "disabling uncommon network protocols"
+mkdir -p /etc/modprobe.d
 backup_file /etc/modprobe.d/uncommon-net-protocols.conf
 cat > /etc/modprobe.d/uncommon-net-protocols.conf <<'EOF'
 install dccp /bin/true
@@ -273,8 +274,8 @@ ok
 # outbound traffic, and it's a common source of "why doesn't X work").
 print_section "Iptables Firewall Configuration"
 
-IPTABLES="/sbin/iptables"
-IP6TABLES="/sbin/ip6tables"
+IPTABLES="$(command -v iptables 2>/dev/null || echo /sbin/iptables)"
+IP6TABLES="$(command -v ip6tables 2>/dev/null || echo /sbin/ip6tables)"
 SSHPORT="22"
 
 if ! have_cmd "$IPTABLES"; then
@@ -1204,23 +1205,17 @@ if [ -d /run/systemd/system ] && have_cmd systemctl; then
     ok
     info "Detected systemd — sandboxing known-safe services"
 
-    # Kernel/namespace-level restrictions only — never filesystem
-    # visibility (ProtectSystem, ProtectHome, PrivateTmp, or
-    # CapabilityBoundingSet), since those require per-service knowledge of
-    # what paths a daemon writes to and getting them wrong breaks the
-    # service. No ordinary background daemon legitimately needs to load
-    # kernel modules, adjust the clock, gain new privileges, get realtime
-    # scheduling, or use exotic namespaces, so this baseline is safe to
-    # apply automatically.
-    SYSTEMD_HARDENING_BASELINE=$(cat <<'EOF'
+    # Directives applied to every candidate with no exceptions: none of
+    # them have any legitimate reason to gain new privileges, adjust the
+    # clock, use exotic namespaces, or change the hostname.
+    SYSTEMD_HARDENING_ALWAYS=$(cat <<'EOF'
 [Service]
 NoNewPrivileges=yes
 ProtectKernelTunables=yes
-ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
-RestrictRealtime=yes
+ProtectHostname=yes
 RestrictSUIDSGID=yes
 RestrictNamespaces=yes
 LockPersonality=yes
@@ -1230,39 +1225,74 @@ SystemCallArchitectures=native
 EOF
 )
 
+    # ProtectKernelModules, RestrictRealtime, and PrivateDevices are each
+    # skipped for the specific services that genuinely rely on what they'd
+    # block, so hardening never costs real functionality:
+    #  - rtkit-daemon exists specifically to grant realtime scheduling to
+    #    other processes (audio servers, etc.) — realtime access is the
+    #    whole point of the service, so RestrictRealtime stays off for it.
+    #  - thermald may need to load the "msr" kernel module to read CPU
+    #    temperature on some hardware, so ProtectKernelModules stays off.
+    #  - CUPS may drive a USB/parallel printer, switcheroo-control switches
+    #    GPUs via /dev/dri, thermald reads CPU temperature via
+    #    /dev/cpu/*/msr, and blueman-mechanism can touch Bluetooth device
+    #    nodes — PrivateDevices stays off for all four.
+    NO_PROTECT_KERNEL_MODULES="thermald.service"
+    NO_RESTRICT_REALTIME="rtkit-daemon.service"
+    NO_PRIVATE_DEVICES="cups.service cups-browsed.service switcheroo-control.service thermald.service blueman-mechanism.service"
+
     # Self-contained background daemons commonly flagged UNSAFE/EXPOSED/
     # MEDIUM by `systemd-analyze security`. Anything not on this list, or
-    # not installed, is left alone and queued as a manual suggestion
-    # instead of guessed at — dbus, NetworkManager, display managers, and
-    # most systemd-* units are deliberately excluded since a wrong guess
-    # on those can break the whole system.
+    # not installed, is left alone entirely — dbus, NetworkManager,
+    # display managers, and most systemd-* units are deliberately
+    # excluded since a wrong guess on those can break the whole system.
     SYSTEMD_HARDEN_CANDIDATES="cron.service crond.service anacron.service rsyslog.service avahi-daemon.service cups.service cups-browsed.service clamav-daemon.service clamav-freshclam.service fail2ban.service irqbalance.service earlyoom.service switcheroo-control.service kerneloops.service preload.service thermald.service uuidd.service accounts-daemon.service power-profiles-daemon.service rtkit-daemon.service blueman-mechanism.service dnsmasq.service networkd-dispatcher.service"
 
-    HARDENED_COUNT=0
+    HARDENED_SERVICES=()
     for svc in $SYSTEMD_HARDEN_CANDIDATES; do
         if systemctl list-unit-files "$svc" --no-legend 2>/dev/null | grep -q .; then
             status "hardening $svc"
             OVERRIDE_DIR="/etc/systemd/system/${svc}.d"
             mkdir -p "$OVERRIDE_DIR"
             backup_file "${OVERRIDE_DIR}/hardening.conf"
-            printf '%s\n' "$SYSTEMD_HARDENING_BASELINE" > "${OVERRIDE_DIR}/hardening.conf"
+            {
+                printf '%s\n' "$SYSTEMD_HARDENING_ALWAYS"
+                case " $NO_PROTECT_KERNEL_MODULES " in
+                    *" $svc "*) : ;;
+                    *) printf 'ProtectKernelModules=yes\n' ;;
+                esac
+                case " $NO_RESTRICT_REALTIME " in
+                    *" $svc "*) : ;;
+                    *) printf 'RestrictRealtime=yes\n' ;;
+                esac
+                case " $NO_PRIVATE_DEVICES " in
+                    *" $svc "*) : ;;
+                    *) printf 'PrivateDevices=yes\n' ;;
+                esac
+            } > "${OVERRIDE_DIR}/hardening.conf"
             chmod 644 "${OVERRIDE_DIR}/hardening.conf"
             ok
-            HARDENED_COUNT=$((HARDENED_COUNT + 1))
-            MANUAL_STEPS+=("Run 'systemd-analyze security $svc' and consider adding ProtectSystem=strict / ProtectHome=read-only / PrivateTmp=yes to ${OVERRIDE_DIR}/hardening.conf if $svc doesn't need broader filesystem access, then: systemctl restart $svc")
+            HARDENED_SERVICES+=("$svc")
         fi
     done
 
-    if [ "$HARDENED_COUNT" -gt 0 ]; then
+    if [ "${#HARDENED_SERVICES[@]}" -gt 0 ]; then
         status "reloading systemd manager configuration"
         systemctl daemon-reload
         ok
-        MANUAL_STEPS+=("Restart the $HARDENED_COUNT hardened systemd service(s) above (or reboot) for the new sandboxing to take effect")
+
+        # try-restart only restarts a service that's already running, and
+        # does nothing to one that isn't — so this applies the sandboxing
+        # immediately wherever it's safe to, with no reboot and nothing
+        # left for the user to do by hand.
+        for svc in "${HARDENED_SERVICES[@]}"; do
+            status "applying sandboxing to $svc"
+            systemctl try-restart "$svc" >/dev/null 2>&1 || true
+            ok
+        done
     else
         info "  No candidate services from the hardening list were found installed"
     fi
-
-    MANUAL_STEPS+=("Run 'systemd-analyze security' with no argument to review any remaining exposed services individually")
 else
     skip "systemd not detected"
 fi
