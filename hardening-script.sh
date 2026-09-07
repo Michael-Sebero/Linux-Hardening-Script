@@ -61,10 +61,12 @@ backup_file() {
     fi
 }
 
-# Init system detection: OpenRC is automated; runit/s6/dinit get manual
-# instructions instead of a guessed command.
+# Init system detection: OpenRC and systemd are automated directly;
+# runit/s6/dinit are automated with their own native enable commands.
 INIT_SYSTEM="unknown"
-if [ -d /run/openrc ] || have_cmd rc-update; then
+if [ -d /run/systemd/system ] && have_cmd systemctl; then
+    INIT_SYSTEM="systemd"
+elif [ -d /run/openrc ] || have_cmd rc-update; then
     INIT_SYSTEM="openrc"
 elif [ -d /etc/runit/sv ] || [ -d /run/runit ]; then
     INIT_SYSTEM="runit"
@@ -74,8 +76,6 @@ elif have_cmd dinitctl; then
     INIT_SYSTEM="dinit"
 fi
 
-MANUAL_STEPS=()
-
 # Tracks whether apply_s6_changes() has anything staged to commit.
 S6_STAGED=0
 
@@ -83,37 +83,58 @@ enable_boot_service() {
     local svc="$1"
     local runlevel="${2:-default}"
     case "$INIT_SYSTEM" in
+        systemd)
+            if systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null | grep -q .; then
+                systemctl enable "${svc}.service" >/dev/null 2>&1 && info "  Enabled '$svc' under systemd" \
+                    || warn "systemctl enable ${svc}.service failed — it may already be enabled or managed another way"
+            else
+                warn "No ${svc}.service unit found — nothing to enable under systemd for '$svc'"
+            fi
+            ;;
         openrc)
+            if [ ! -f "/etc/init.d/$svc" ] && have_cmd pacman; then
+                pacman -S --noconfirm --needed "${svc}-openrc" >/dev/null 2>&1 || true
+            fi
             if [ -f "/etc/init.d/$svc" ]; then
                 rc-update add "$svc" "$runlevel" >/dev/null 2>&1 || true
                 info "  Enabled '$svc' at OpenRC runlevel '$runlevel'"
             else
-                warn "OpenRC script for '$svc' not found at /etc/init.d/$svc — install ${svc}-openrc (or equivalent) then run: rc-update add $svc $runlevel"
-                MANUAL_STEPS+=("pacman -S ${svc}-openrc && rc-update add $svc $runlevel")
+                warn "OpenRC script for '$svc' still not found at /etc/init.d/$svc after attempting to install ${svc}-openrc — '$svc' will not start at boot"
             fi
             ;;
         runit)
-            MANUAL_STEPS+=("ln -s /etc/runit/sv/$svc /run/runit/service   # enable '$svc' under runit")
+            if [ -d "/etc/runit/sv/$svc" ] && [ -d /run/runit/service ]; then
+                ln -sf "/etc/runit/sv/$svc" /run/runit/service 2>/dev/null && info "  Enabled '$svc' under runit" \
+                    || warn "Could not symlink '$svc' into /run/runit/service"
+            else
+                warn "No runit service definition found for '$svc' at /etc/runit/sv/$svc — nothing to enable"
+            fi
             ;;
         s6)
+            if ! have_cmd s6 && have_cmd pacman; then
+                pacman -S --noconfirm --needed "${svc}-s6" >/dev/null 2>&1 || true
+            fi
             if have_cmd s6; then
                 if S6_OUT=$(s6 set enable "$svc" 2>&1); then
                     info "  Enabled '$svc' under s6 (s6 set enable $svc)"
                     S6_STAGED=1
                 else
-                    warn "'s6 set enable $svc' failed — it may not be installed for s6. Try: pacman -S ${svc}-s6. Details: $S6_OUT"
-                    MANUAL_STEPS+=("pacman -S ${svc}-s6 && s6 set enable $svc")
+                    warn "'s6 set enable $svc' failed even after attempting to install ${svc}-s6. Details: $S6_OUT"
                 fi
             else
-                warn "s6 was detected as the init system but the 's6' command isn't on PATH — enable manually: s6 set enable $svc"
-                MANUAL_STEPS+=("s6 set enable $svc")
+                warn "s6 was detected as the init system but the 's6' command still isn't available — could not enable '$svc'"
             fi
             ;;
         dinit)
-            MANUAL_STEPS+=("dinitctl enable $svc   # enable '$svc' under dinit")
+            if have_cmd dinitctl; then
+                dinitctl enable "$svc" >/dev/null 2>&1 && info "  Enabled '$svc' under dinit" \
+                    || warn "'dinitctl enable $svc' failed"
+            else
+                warn "dinit was detected as the init system but 'dinitctl' isn't available — could not enable '$svc'"
+            fi
             ;;
         *)
-            MANUAL_STEPS+=("Enable the '$svc' service manually — could not detect your init system")
+            warn "Could not detect a supported init system — '$svc' was not enabled at boot"
             ;;
     esac
 }
@@ -123,16 +144,14 @@ apply_s6_changes() {
     [ "$INIT_SYSTEM" = "s6" ] || return 0
     [ "$S6_STAGED" -eq 1 ] || return 0
     if ! have_cmd s6; then
-        warn "s6 changes were staged but the 's6' command isn't on PATH to commit them — run manually: s6 set commit && s6 live install"
-        MANUAL_STEPS+=("s6 set commit && s6 live install")
+        warn "s6 changes were staged but the 's6' command isn't available to commit them"
         return 0
     fi
     status "committing and applying staged s6 service changes"
     if S6_OUT=$(s6 set commit 2>&1 && s6 live install 2>&1); then
         ok
     else
-        warn "'s6 set commit && s6 live install' failed — services enabled above may not be active until you run that manually. Details: $S6_OUT"
-        MANUAL_STEPS+=("s6 set commit && s6 live install")
+        warn "'s6 set commit && s6 live install' failed — services enabled above may not be active yet. Details: $S6_OUT"
     fi
 }
 
@@ -276,7 +295,62 @@ print_section "Iptables Firewall Configuration"
 
 IPTABLES="$(command -v iptables 2>/dev/null || echo /sbin/iptables)"
 IP6TABLES="$(command -v ip6tables 2>/dev/null || echo /sbin/ip6tables)"
+IPTABLES_RESTORE="$(command -v iptables-restore 2>/dev/null || echo /sbin/iptables-restore)"
+IP6TABLES_RESTORE="$(command -v ip6tables-restore 2>/dev/null || echo /sbin/ip6tables-restore)"
 SSHPORT="22"
+
+# Persists a saved ruleset across reboot regardless of init system, and
+# regardless of whether the distro ships a native iptables.service (Arch/
+# Artix do; Debian/Ubuntu/Mint typically don't). On systemd, the native
+# unit is used if one exists; otherwise a minimal restore-on-boot unit is
+# created and enabled instead, so the ruleset survives a reboot either way
+# with nothing left for you to do.
+persist_firewall_boot() {
+    local family="$1" svc="$2" rules_file="$3" restore_bin="$4"
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        if systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null | grep -q .; then
+            systemctl enable "${svc}.service" >/dev/null 2>&1 || true
+        else
+            backup_file "/etc/systemd/system/${svc}-restore.service"
+            cat > "/etc/systemd/system/${svc}-restore.service" <<EOF
+[Unit]
+Description=Restore $family firewall rules (installed by hardening script)
+DefaultDependencies=no
+Before=network-pre.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=$restore_bin $rules_file
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            chmod 644 "/etc/systemd/system/${svc}-restore.service"
+            systemctl daemon-reload
+            systemctl enable "${svc}-restore.service" >/dev/null 2>&1 || true
+        fi
+    elif [ "$INIT_SYSTEM" = "runit" ] && [ ! -d "/etc/runit/sv/$svc" ]; then
+        mkdir -p "/etc/runit/sv/${svc}-restore"
+        backup_file "/etc/runit/sv/${svc}-restore/run"
+        cat > "/etc/runit/sv/${svc}-restore/run" <<EOF
+#!/bin/sh
+# Restores $family firewall rules at boot (installed by hardening script).
+exec 2>&1
+$restore_bin $rules_file
+exec sleep infinity
+EOF
+        chmod 755 "/etc/runit/sv/${svc}-restore/run"
+        if [ -d /run/runit/service ]; then
+            ln -sf "/etc/runit/sv/${svc}-restore" /run/runit/service 2>/dev/null || true
+        fi
+    else
+        enable_boot_service "$svc" default
+    fi
+}
 
 if ! have_cmd "$IPTABLES"; then
     warn "iptables not found at $IPTABLES — skipping firewall configuration entirely"
@@ -429,7 +503,7 @@ iptables-save > /etc/iptables/iptables.rules
 ok
 
 status "enabling iptables at boot"
-enable_boot_service iptables default
+persist_firewall_boot "IPv4" iptables /etc/iptables/iptables.rules "$IPTABLES_RESTORE"
 ok
 
 # ========================================================
@@ -458,7 +532,7 @@ else
     ok
 
     status "enabling ip6tables at boot"
-    enable_boot_service ip6tables default
+    persist_firewall_boot "IPv6" ip6tables /etc/iptables/ip6tables.rules "$IP6TABLES_RESTORE"
     ok
 fi
 
@@ -762,12 +836,25 @@ fi
 chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null || true
 
 status "restricting su to wheel group"
+if have_cmd getent && ! getent group wheel >/dev/null 2>&1; then
+    groupadd wheel 2>/dev/null && info "  Created the 'wheel' group (none existed on this system)"
+fi
 if ! grep -q "auth required pam_wheel.so" /etc/pam.d/su 2>/dev/null; then
   backup_file /etc/pam.d/su
   echo "auth required pam_wheel.so use_uid" >> /etc/pam.d/su
 fi
 if have_cmd getent && [ -z "$(getent group wheel | cut -d: -f4)" ]; then
-    warn "no supplementary members currently listed in the 'wheel' group (this check can't see a user whose *primary* group is wheel, so ignore if that's you) — if 'su' stops working, run: usermod -aG wheel <youruser>"
+    INVOKING_USER="${SUDO_USER:-}"
+    if [ -z "$INVOKING_USER" ] && have_cmd logname; then
+        INVOKING_USER="$(logname 2>/dev/null || true)"
+    fi
+    if [ -n "$INVOKING_USER" ] && [ "$INVOKING_USER" != "root" ] && id "$INVOKING_USER" >/dev/null 2>&1; then
+        usermod -aG wheel "$INVOKING_USER" 2>/dev/null \
+            && info "  Added '$INVOKING_USER' to the wheel group so su keeps working" \
+            || warn "Could not add '$INVOKING_USER' to the wheel group automatically — su may stop working for that user"
+    else
+        warn "no supplementary members currently listed in the 'wheel' group, and the invoking user couldn't be determined automatically (this check also can't see a user whose *primary* group is wheel, so ignore if that's you)"
+    fi
 fi
 ok
 
@@ -1053,21 +1140,23 @@ DATAONLY = p+n+u+g+s+acl+xattrs+md5+sha256+rmd160+tiger
 EOF
 ok
 
-# Deliberately not running `aide --init` here (a multi-minute full scan) —
-# the daily check below no-ops until you run it, queued in the summary.
 status "scheduling daily AIDE checks"
 if have_cmd aide; then
     cat > /etc/cron.d/aide-check <<'EOF'
 # Daily AIDE integrity check, installed by the hardening script.
-# No-ops quietly until the database has been initialized (see the
-# hardening script's final summary for the one-time init command).
 0 3 * * * root [ -f /var/lib/aide/aide.db.gz ] && /usr/bin/aide --check >> /var/log/aide/aide-check.log 2>&1
 EOF
     chmod 644 /etc/cron.d/aide-check
-    MANUAL_STEPS+=("Initialize the AIDE database (a few minutes, run whenever convenient): aide --init && mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz")
     ok
+
+    status "initializing AIDE database (this can take a few minutes)"
+    if aide --init >/var/log/aide/aide-init.log 2>&1 && mv -f /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz 2>/dev/null; then
+        ok
+    else
+        warn "AIDE database initialization did not finish cleanly — see /var/log/aide/aide-init.log. The daily check will start working automatically once /var/lib/aide/aide.db.gz exists."
+    fi
 else
-    skip "aide not installed — config is in place for whenever you install it (pacman -S aide)"
+    skip "aide not installed — nothing to schedule"
 fi
 
 # ========================================================
@@ -1105,12 +1194,16 @@ ok
 
 status "disabling legacy/insecure services (if present and enabled)"
 # Only stops something already installed AND enabled from auto-starting
-# next boot — re-enable with: rc-update add <service> <runlevel>.
+# next boot.
 for svc in telnetd inetd xinetd tftpd rsh rlogind rexecd ypbind nis; do
     if [ "$INIT_SYSTEM" = "openrc" ] && [ -f "/etc/init.d/$svc" ]; then
         if rc-update show 2>/dev/null | grep -qE "^[[:space:]]*${svc}[[:space:]]*\|"; then
             rc-update del "$svc" >/dev/null 2>&1 || true
             info "  Disabled legacy service: $svc"
+        fi
+    elif [ "$INIT_SYSTEM" = "systemd" ] && have_cmd systemctl; then
+        if systemctl is-enabled "${svc}.service" >/dev/null 2>&1; then
+            systemctl disable "${svc}.service" >/dev/null 2>&1 && info "  Disabled legacy service: $svc"
         fi
     fi
 done
@@ -1123,14 +1216,20 @@ for svc in rsyslog syslog-ng socklog-unix busybox-syslogd; do
         enable_boot_service "$svc" default
         SYSLOG_FOUND=1
         break
+    elif [ "$INIT_SYSTEM" = "systemd" ] && have_cmd systemctl && systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null | grep -q .; then
+        enable_boot_service "$svc" default
+        SYSLOG_FOUND=1
+        break
     fi
 done
-if [ "$SYSLOG_FOUND" -eq 0 ]; then
-    if [ "$INIT_SYSTEM" = "openrc" ]; then
-        warn "no syslog daemon found (rsyslog/syslog-ng/socklog) — the firewall's LOG rules (and most Lynis logging checks) have nowhere persistent to write to. Consider: pacman -S rsyslog rsyslog-openrc"
-    else
-        skip "can't check on this init system — verify a syslog daemon is enabled manually"
-    fi
+if [ "$SYSLOG_FOUND" -eq 1 ]; then
+    ok
+elif [ "$INIT_SYSTEM" = "systemd" ]; then
+    # systemd-journald handles logging by default even with no separate
+    # syslog daemon installed, so there's always somewhere for logs to go.
+    ok
+else
+    skip "no syslog daemon found (rsyslog/syslog-ng/socklog) to enable"
 fi
 
 status "ensuring auditd is enabled (if installed)"
@@ -1138,7 +1237,7 @@ if have_cmd auditd || [ -f /etc/init.d/auditd ]; then
     enable_boot_service auditd default
     ok
 else
-    skip "auditd not installed — not configuring it. It's one of Lynis's higher-value suggestions if you want to chase the score further: pacman -S audit audit-openrc"
+    skip "auditd not installed — nothing to configure"
 fi
 
 # All enable_boot_service calls for this run happen above this line --
@@ -1306,13 +1405,6 @@ if [ "${#WARNINGS[@]}" -gt 0 ]; then
     printf "\nWarnings from this run:\n"
     for w in "${WARNINGS[@]}"; do
         printf "  [!] %s\n" "$w"
-    done
-fi
-
-if [ "${#MANUAL_STEPS[@]}" -gt 0 ]; then
-    printf "\nManual follow-up steps:\n"
-    for m in "${MANUAL_STEPS[@]}"; do
-        printf "  - %s\n" "$m"
     done
 fi
 
