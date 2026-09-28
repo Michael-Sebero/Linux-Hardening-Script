@@ -1,1413 +1,927 @@
 #!/bin/bash
+# Usage: hardening.sh [--revert]
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
+[ "$(id -u)" -eq 0 ] || { echo "FAIL  run as root" >&2; exit 1; }
+set -uo pipefail
+umask 022
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
 
-# Re-exec under bash if this was invoked via sh/dash instead (e.g. `sh
-# hardening-script.sh`) — `set -o pipefail` and other bash-only syntax
-# below are not POSIX and fail immediately under a non-bash shell.
-if [ -z "${BASH_VERSION:-}" ]; then
-    exec bash "$0" "$@"
-fi
+SSH_PORT=""                 # empty keeps the port sshd already listens on
+SSH_FROM=any                # any | lan | none
+SSH_PASSWORDS=auto          # auto: off once a user has authorized_keys | yes | no
+IPV6=block                  # block | allow
+LAN_NETS=""                 # e.g. "192.168.1.0/24 fd00:1::/64"; LAN_* ports open only to these
+LAN_TCP="27036:27037"       # Steam Remote Play
+LAN_UDP="27031:27036 5353"  # Steam Remote Play, mDNS
+PUBLIC_TCP=""               # open to any source, e.g. "6881:6889 27015"
+PUBLIC_UDP=""
+DNS_LOCK=auto               # auto: on when dnscrypt-proxy runs and resolv.conf is loopback-only | yes | no
+MDNS_PUBLISH=no             # no: avahi browses but stops announcing this host
+YESCRYPT_COST=8             # 128 MiB per hash
+TMOUT_SECONDS=1800
+STATE=/var/lib/hardening
 
-# Check if running as root
-if [ "$(id -u)" -ne 0 ]; then
-    echo "ERROR: This script must be run as root" >&2
-    exit 1
-fi
+NPASS=0 NFAIL=0
+pass() { printf 'PASS  %s\n' "$*"; NPASS=$((NPASS + 1)); }
+fail() { printf 'FAIL  %s\n' "$*"; NFAIL=$((NFAIL + 1)); }
+skip() { printf 'SKIP  %s\n' "$*"; }
+info() { printf '      %s\n' "$*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
 
-# Enable strict error handling
-set -euo pipefail
-
-# ------------------------------------------------------------------------
-# Output helpers
-# ------------------------------------------------------------------------
-print_section() {
-    printf "\n"
-    printf "================================================================\n"
-    printf "  %s\n" "$1"
-    printf "================================================================\n"
+save() {
+    local f
+    for f; do
+        [ -e "$STATE/orig$f" ] || [ -e "$STATE/new$f" ] && continue
+        if [ -e "$f" ] || [ -L "$f" ]; then
+            mkdir -p "$STATE/orig${f%/*}" && cp -a "$f" "$STATE/orig$f"
+        else
+            mkdir -p "$STATE/new${f%/*}" && : > "$STATE/new$f"
+        fi
+    done
 }
 
-status() {
-    printf "%-60s" "$1..." >&2
+put() {
+    local mode=$1 f=$2 tmp
+    tmp=$(mktemp) || return 1
+    cat > "$tmp"
+    if [ -f "$f" ] && cmp -s "$tmp" "$f"; then
+        rm -f "$tmp"; chmod "$mode" "$f"; return 0
+    fi
+    save "$f"
+    [ -d "${f%/*}" ] || { mkdir -p "${f%/*}" && printf '%s\n' "${f%/*}" >> "$STATE/newdirs"; }
+    install -m "$mode" "$tmp" "$f"
+    local rc=$?
+    rm -f "$tmp"
+    return $rc
 }
 
-ok() {
-    printf " done\n" >&2
+edit() {
+    local f=$1; shift
+    save "$f"
+    sed -i "$@" "$f"
 }
 
-skip() {
-    printf " skipped (%s)\n" "$1" >&2
+set_mode() {
+    local m=$1 p; shift
+    for p; do
+        [ -e "$p" ] || continue
+        awk -F'\t' -v p="$p" '$2 == p { f = 1 } END { exit !f }' "$STATE/modes" 2>/dev/null ||
+            printf '%s\t%s\n' "$(stat -c %a "$p")" "$p" >> "$STATE/modes"
+        chmod "$m" "$p"
+    done
 }
 
-info() {
-    printf "%s\n" "$1"
-}
-
-WARNINGS=()
-warn() {
-    printf "  [!] %s\n" "$1" >&2
-    WARNINGS+=("$1")
-}
-
-have_cmd() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-backup_file() {
-    local file="$1"
-    if [ -f "$file" ]; then
-        local dest="${BACKUP_DIR}${file}"
-        mkdir -p "$(dirname "$dest")"
-        cp -p "$file" "$dest" 2>/dev/null || true
+set_def() {
+    local f=$1 k=$2 v=$3
+    if grep -Eq "^[[:space:]]*${k}[[:space:]]" "$f"; then
+        grep -Eq "^${k}[[:space:]]+$v\$" "$f" || edit "$f" -E "s|^[[:space:]]*${k}[[:space:]].*|$k\t$v|"
+    else
+        save "$f"; printf '%s\t%s\n' "$k" "$v" >> "$f"
     fi
 }
 
-# Init system detection: OpenRC and systemd are automated directly;
-# runit/s6/dinit are automated with their own native enable commands.
-INIT_SYSTEM="unknown"
-if [ -d /run/systemd/system ] && have_cmd systemctl; then
-    INIT_SYSTEM="systemd"
-elif [ -d /run/openrc ] || have_cmd rc-update; then
-    INIT_SYSTEM="openrc"
-elif [ -d /etc/runit/sv ] || [ -d /run/runit ]; then
-    INIT_SYSTEM="runit"
-elif [ -d /etc/s6/sv ] || have_cmd s6-rc; then
-    INIT_SYSTEM="s6"
-elif have_cmd dinitctl; then
-    INIT_SYSTEM="dinit"
+set_kv() {
+    local f=$1 k=$2 v=$3
+    if grep -Eq "^[[:space:]]*${k}[[:space:]]*=" "$f"; then
+        grep -Eq "^$k = $v\$" "$f" || edit "$f" -E "s|^[[:space:]]*${k}[[:space:]]*=.*|$k = $v|"
+    else
+        save "$f"; printf '%s = %s\n' "$k" "$v" >> "$f"
+    fi
+}
+
+ver_ge() { [ "$(printf '%s\n%s\n' "$2" "${1%%-*}" | sort -V | head -1)" = "$2" ]; }
+
+IN_CHROOT=0
+[ "$(stat -Lc %d:%i / 2>/dev/null)" = "$(stat -Lc %d:%i /proc/1/root/ 2>/dev/null)" ] || IN_CHROOT=1
+
+INIT=unknown
+if [ "$IN_CHROOT" = 0 ]; then
+    case "$(cat /proc/1/comm 2>/dev/null)" in
+        systemd) INIT=systemd ;;
+        openrc-init) INIT=openrc ;;
+        runit|runit-init) INIT=runit ;;
+        s6-svscan) INIT=s6 ;;
+        dinit) INIT=dinit ;;
+    esac
+fi
+if [ "$INIT" = unknown ]; then
+    if [ -x /usr/lib/systemd/systemd ] || [ -x /lib/systemd/systemd ]; then INIT=systemd
+    elif have openrc || have rc-update; then INIT=openrc
+    elif have s6-svscan && { [ -d /etc/s6 ] || have s6-rc; }; then INIT=s6
+    elif have runsvdir; then INIT=runit
+    elif have dinit; then INIT=dinit
+    fi
 fi
 
-# Tracks whether apply_s6_changes() has anything staged to commit.
-S6_STAGED=0
+ADMIN=${DOAS_USER:-${SUDO_USER:-}}
+[ -n "$ADMIN" ] || ADMIN=$(logname 2>/dev/null) || true
+if [ -z "$ADMIN" ] && [ -r /proc/self/loginuid ]; then
+    lu=$(cat /proc/self/loginuid)
+    [ "$lu" != 4294967295 ] && ADMIN=$(id -nu "$lu" 2>/dev/null || true)
+fi
+[ "$ADMIN" = root ] && ADMIN=""
 
-enable_boot_service() {
-    local svc="$1"
-    local runlevel="${2:-default}"
-    case "$INIT_SYSTEM" in
+SSHD=$(command -v sshd || echo /usr/sbin/sshd)
+
+S6_STAGED=0
+pac_try() { have pacman && pacman -S --needed --noconfirm "$1" >/dev/null 2>&1; }
+
+enable_service() {
+    local s=$1 p=$1 sv dst
+    case $s in auditd) p=audit ;; ip6tables) p=iptables ;; esac
+    case $INIT in
         systemd)
-            if systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null | grep -q .; then
-                systemctl enable "${svc}.service" >/dev/null 2>&1 && info "  Enabled '$svc' under systemd" \
-                    || warn "systemctl enable ${svc}.service failed — it may already be enabled or managed another way"
-            else
-                warn "No ${svc}.service unit found — nothing to enable under systemd for '$svc'"
-            fi
-            ;;
+            systemctl enable "$s.service" >/dev/null 2>&1 ;;
         openrc)
-            if [ ! -f "/etc/init.d/$svc" ] && have_cmd pacman; then
-                pacman -S --noconfirm --needed "${svc}-openrc" >/dev/null 2>&1 || true
-            fi
-            if [ -f "/etc/init.d/$svc" ]; then
-                rc-update add "$svc" "$runlevel" >/dev/null 2>&1 || true
-                info "  Enabled '$svc' at OpenRC runlevel '$runlevel'"
-            else
-                warn "OpenRC script for '$svc' still not found at /etc/init.d/$svc after attempting to install ${svc}-openrc — '$svc' will not start at boot"
-            fi
-            ;;
+            [ -f "/etc/init.d/$s" ] || pac_try "$p-openrc"
+            [ -f "/etc/init.d/$s" ] || return 1
+            rc-update add "$s" default >/dev/null 2>&1
+            return 0 ;;
         runit)
-            if [ -d "/etc/runit/sv/$svc" ] && [ -d /run/runit/service ]; then
-                ln -sf "/etc/runit/sv/$svc" /run/runit/service 2>/dev/null && info "  Enabled '$svc' under runit" \
-                    || warn "Could not symlink '$svc' into /run/runit/service"
-            else
-                warn "No runit service definition found for '$svc' at /etc/runit/sv/$svc — nothing to enable"
-            fi
-            ;;
+            sv=/etc/runit/sv; [ -d "$sv" ] || sv=/etc/sv
+            [ -d "$sv/$s" ] || pac_try "$p-runit"
+            [ -d "$sv/$s" ] || return 1
+            for dst in /run/runit/service /var/service /etc/runit/runsvdir/default; do
+                [ -d "$dst" ] && { ln -sfn "$sv/$s" "$dst/$s"; return; }
+            done
+            return 1 ;;
         s6)
-            if ! have_cmd s6 && have_cmd pacman; then
-                pacman -S --noconfirm --needed "${svc}-s6" >/dev/null 2>&1 || true
-            fi
-            if have_cmd s6; then
-                if S6_OUT=$(s6 set enable "$svc" 2>&1); then
-                    info "  Enabled '$svc' under s6 (s6 set enable $svc)"
-                    S6_STAGED=1
-                else
-                    warn "'s6 set enable $svc' failed even after attempting to install ${svc}-s6. Details: $S6_OUT"
-                fi
-            else
-                warn "s6 was detected as the init system but the 's6' command still isn't available — could not enable '$svc'"
-            fi
-            ;;
+            have s6 || return 1
+            s6 set enable "$s" >/dev/null 2>&1 || { pac_try "$p-s6" && s6 set enable "$s" >/dev/null 2>&1; } || return 1
+            S6_STAGED=1 ;;
         dinit)
-            if have_cmd dinitctl; then
-                dinitctl enable "$svc" >/dev/null 2>&1 && info "  Enabled '$svc' under dinit" \
-                    || warn "'dinitctl enable $svc' failed"
-            else
-                warn "dinit was detected as the init system but 'dinitctl' isn't available — could not enable '$svc'"
-            fi
-            ;;
-        *)
-            warn "Could not detect a supported init system — '$svc' was not enabled at boot"
-            ;;
+            [ -f "/etc/dinit.d/$s" ] || pac_try "$p-dinit"
+            [ -f "/etc/dinit.d/$s" ] || return 1
+            dinitctl enable "$s" >/dev/null 2>&1 || { mkdir -p /etc/dinit.d/boot.d && ln -sf "/etc/dinit.d/$s" /etc/dinit.d/boot.d/; } ;;
+        *) return 1 ;;
     esac
 }
 
-# Commits and live-applies whatever enable_boot_service staged under s6.
-apply_s6_changes() {
-    [ "$INIT_SYSTEM" = "s6" ] || return 0
-    [ "$S6_STAGED" -eq 1 ] || return 0
-    if ! have_cmd s6; then
-        warn "s6 changes were staged but the 's6' command isn't available to commit them"
-        return 0
-    fi
-    status "committing and applying staged s6 service changes"
-    if S6_OUT=$(s6 set commit 2>&1 && s6 live install 2>&1); then
-        ok
+s6_commit() {
+    [ "$INIT" = s6 ] && [ "$S6_STAGED" = 1 ] || return 0
+    if s6 set commit >/dev/null 2>&1; then
+        pass "s6: service changes committed"
+        s6 live install >/dev/null 2>&1 || info "s6: live install failed, changes apply at next boot"
     else
-        warn "'s6 set commit && s6 live install' failed — services enabled above may not be active yet. Details: $S6_OUT"
+        fail "s6: 's6 set commit' failed, enabled services will not start at boot"
     fi
 }
 
-print_section "Starting system hardening process"
-info "Detected init system: $INIT_SYSTEM"
+sshd_check() {
+    local tmp="" out rc
+    local -a k=()
+    if ! ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1; then
+        tmp=$(mktemp -d) && ssh-keygen -q -t ed25519 -N '' -f "$tmp/k" >/dev/null 2>&1 && k=(-h "$tmp/k")
+    fi
+    out=$("$SSHD" "$@" ${k[@]+"${k[@]}"} 2>&1); rc=$?
+    case $out in
+        *"Missing privilege separation directory: "*)
+            out=${out##*directory: }
+            mkdir -p "${out%%[[:space:]]*}"
+            out=$("$SSHD" "$@" ${k[@]+"${k[@]}"} 2>&1); rc=$? ;;
+    esac
+    [ -n "$tmp" ] && rm -rf "$tmp"
+    printf '%s\n' "$out"
+    return $rc
+}
 
-# Create backup directory
-BACKUP_DIR="/root/hardening-backups-$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$BACKUP_DIR"
-info "Backups of any file this script overwrites will be stored under: $BACKUP_DIR"
+yescrypt_ok() {
+    grep -q '^[^:]*:\$y\$' /etc/shadow 2>/dev/null && return 0
+    have perl && perl -e 'my $h = crypt("x", q($y$j9T$KcY5dS0bTG4I1RP2rHBaX.)); exit(defined $h && $h =~ /^\$y\$/ ? 0 : 1)'
+}
 
-# ========================================================
-# FILE PERMISSIONS
-# ========================================================
-print_section "File Permissions"
+pristine() {
+    local f=$1 bad=$2 d pkg ver c tmp
+    if [ -f "$f.pacnew" ]; then echo "$f.pacnew"; return; fi
+    if have pacman && have bsdtar && pkg=$(pacman -Qqo "$f" 2>/dev/null); then
+        ver=$(pacman -Q "$pkg" | awk '{print $2}')
+        for c in /var/cache/pacman/pkg/"$pkg-$ver"-*.pkg.tar.*; do
+            case $c in *.sig) continue ;; esac
+            [ -f "$c" ] || continue
+            tmp=$(mktemp)
+            if bsdtar -xOf "$c" "${f#/}" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then echo "$tmp"; return; fi
+            rm -f "$tmp"
+        done
+    fi
+    for d in /root/hardening-backups-*/; do
+        [ -f "$d${f#/}" ] || continue
+        [ "$(sha256sum < "$d${f#/}" | cut -c1-16)" = "$bad" ] && continue
+        echo "$d${f#/}"; return
+    done
+    return 1
+}
 
-status "setting secure file permissions"
-chmod 700 /root
-chmod 600 /etc/shadow /etc/gshadow
-chmod 644 /etc/passwd /etc/group
-[ -f /etc/sudoers ] && chmod 600 /etc/sudoers
-[ -f /etc/doas.conf ] && chmod 600 /etc/doas.conf
-chmod -R 700 /etc/ssl/private 2>/dev/null || true
-chmod -R 755 /etc/ssl/certs 2>/dev/null || true
-find /etc/cron.* -type f -exec chmod 0700 {} \; 2>/dev/null || true
-chmod 0700 /etc/cron.d /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /etc/cron.hourly 2>/dev/null || true
-chmod 0600 /etc/crontab 2>/dev/null || true
-chmod 0600 /etc/ssh/sshd_config 2>/dev/null || true
-ok
-
-# ========================================================
-# HOST CONFIGURATION
-# ========================================================
-status "configuring host resolver"
-backup_file /etc/host.conf
-cat <<'EOF' > /etc/host.conf
-order bind,hosts
-multi on
-EOF
-ok
-
-# ========================================================
-# KERNEL MODULE CONFIGURATION
-# ========================================================
-print_section "Kernel Module Configuration"
-
-status "loading netfilter modules"
-MODPROBE="/sbin/modprobe"
-"$MODPROBE" nf_conntrack_ftp 2>/dev/null || "$MODPROBE" ip_conntrack_ftp 2>/dev/null || true
-"$MODPROBE" nf_conntrack_irc 2>/dev/null || "$MODPROBE" ip_conntrack_irc 2>/dev/null || true
-ok
-
-status "disabling uncommon network protocols"
-mkdir -p /etc/modprobe.d
-backup_file /etc/modprobe.d/uncommon-net-protocols.conf
-cat > /etc/modprobe.d/uncommon-net-protocols.conf <<'EOF'
-install dccp /bin/true
-install sctp /bin/true
-install rds /bin/true
-install tipc /bin/true
-install n-hdlc /bin/true
-install ax25 /bin/true
-install netrom /bin/true
-install x25 /bin/true
-install rose /bin/true
-install decnet /bin/true
-install econet /bin/true
-install af_802154 /bin/true
-install ipx /bin/true
-install appletalk /bin/true
-install psnap /bin/true
-install p8023 /bin/true
-install p8022 /bin/true
-install can /bin/true
-install atm /bin/true
-EOF
-ok
-
-status "disabling uncommon filesystems"
-backup_file /etc/modprobe.d/uncommon-filesystems.conf
-cat > /etc/modprobe.d/uncommon-filesystems.conf <<'EOF'
-install cramfs /bin/true
-install freevxfs /bin/true
-install jffs2 /bin/true
-install hfs /bin/true
-install hfsplus /bin/true
-install squashfs /bin/true
-install udf /bin/true
-EOF
-ok
-
-status "blacklisting firewire modules"
-backup_file /etc/modprobe.d/blacklist-firewire.conf
-cat > /etc/modprobe.d/blacklist-firewire.conf <<'EOF'
-blacklist firewire-core
-blacklist firewire-ohci
-blacklist firewire-net
-blacklist firewire-serial
-blacklist firewire-sbp2
-EOF
-ok
-
-# ========================================================
-# TCP/IP STACK HARDENING
-# ========================================================
-# These are raw /proc/sys writes: applied immediately, but not persisted
-# across reboot unless mirrored in /etc/sysctl.d.
-print_section "TCP/IP Stack Hardening"
-
-status "hardening TCP/IP stack (runtime)"
-# IP spoofing protection
-for i in /proc/sys/net/ipv4/conf/*/rp_filter; do { echo 1 > "$i"; } 2>/dev/null || true; done
-
-# TCP hardening
-echo 1 > /proc/sys/net/ipv4/tcp_syncookies
-echo 0 > /proc/sys/net/ipv4/icmp_echo_ignore_all
-echo 1 > /proc/sys/net/ipv4/icmp_echo_ignore_broadcasts
-echo 1 > /proc/sys/net/ipv4/icmp_ignore_bogus_error_responses
-
-# Log martian packets
-for i in /proc/sys/net/ipv4/conf/*/log_martians; do { echo 1 > "$i"; } 2>/dev/null || true; done
-
-# Disable forwarding and redirects
-for i in /proc/sys/net/ipv4/conf/*/accept_redirects; do { echo 0 > "$i"; } 2>/dev/null || true; done
-for i in /proc/sys/net/ipv4/conf/*/send_redirects; do { echo 0 > "$i"; } 2>/dev/null || true; done
-for i in /proc/sys/net/ipv4/conf/*/accept_source_route; do { echo 0 > "$i"; } 2>/dev/null || true; done
-
-# Disable multicast forwarding and proxy ARP
-for i in /proc/sys/net/ipv4/conf/*/mc_forwarding; do { echo 0 > "$i"; } 2>/dev/null || true; done
-for i in /proc/sys/net/ipv4/conf/*/proxy_arp; do { echo 0 > "$i"; } 2>/dev/null || true; done
-for i in /proc/sys/net/ipv4/conf/*/secure_redirects; do { echo 1 > "$i"; } 2>/dev/null || true; done
-for i in /proc/sys/net/ipv4/conf/*/bootp_relay; do { echo 0 > "$i"; } 2>/dev/null || true; done
-ok
-
-# ========================================================
-# IPTABLES FIREWALL CONFIGURATION
-# ========================================================
-# OUTPUT stays permissive on purpose (Lynis doesn't require locking down
-# outbound traffic, and it's a common source of "why doesn't X work").
-print_section "Iptables Firewall Configuration"
-
-IPTABLES="$(command -v iptables 2>/dev/null || echo /sbin/iptables)"
-IP6TABLES="$(command -v ip6tables 2>/dev/null || echo /sbin/ip6tables)"
-IPTABLES_RESTORE="$(command -v iptables-restore 2>/dev/null || echo /sbin/iptables-restore)"
-IP6TABLES_RESTORE="$(command -v ip6tables-restore 2>/dev/null || echo /sbin/ip6tables-restore)"
-SSHPORT="22"
-
-# Persists a saved ruleset across reboot regardless of init system, and
-# regardless of whether the distro ships a native iptables.service (Arch/
-# Artix do; Debian/Ubuntu/Mint typically don't). On systemd, the native
-# unit is used if one exists; otherwise a minimal restore-on-boot unit is
-# created and enabled instead, so the ruleset survives a reboot either way
-# with nothing left for you to do.
-persist_firewall_boot() {
-    local family="$1" svc="$2" rules_file="$3" restore_bin="$4"
-    if [ "$INIT_SYSTEM" = "systemd" ]; then
-        if systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null | grep -q .; then
-            systemctl enable "${svc}.service" >/dev/null 2>&1 || true
+legacy_repair() {
+    local ev=0 e f h src
+    ls -d /root/hardening-backups-*/ >/dev/null 2>&1 && ev=1
+    grep -qs '^install squashfs /bin/true$' /etc/modprobe.d/uncommon-filesystems.conf && ev=1
+    [ "$ev" = 1 ] || return 0
+    for e in /etc/profile:4bcb10381b732ff2 /etc/bash.bashrc:0725202b30e1f923 /etc/shells:cebbd16e1135550a \
+             /etc/login.defs:aadde12cc06385c5 /etc/ssh/ssh_config:0e89333e4bd82cb6 /etc/makepkg.conf:f92355fae445b46a \
+             /etc/host.conf:18391637e7a31586 /etc/locale.gen:433c51fe92a94ce4 /etc/locale.conf:3665a41fa8e3f8fd \
+             /etc/environment:3405a141d908ea12 /etc/vconsole.conf:733dd6663595cc62 /etc/conf.d/wireless-regdom:3c98edd20d55fb43 \
+             /etc/aide.conf:d70b34ef5c4a7417 /etc/security/faillock.conf:e3b2224b885b35ac; do
+        f=${e%%:*} h=${e#*:}
+        [ -f "$f" ] && [ "$(sha256sum < "$f" | cut -c1-16)" = "$h" ] || continue
+        if src=$(pristine "$f" "$h"); then
+            cp "$src" "$f" && pass "legacy: restored $f from $src"
+            case $src in /tmp/*) rm -f "$src" ;; *.pacnew) rm -f "$src" ;; esac
         else
-            backup_file "/etc/systemd/system/${svc}-restore.service"
-            cat > "/etc/systemd/system/${svc}-restore.service" <<EOF
+            case $f in /etc/locale.*|/etc/environment|/etc/vconsole.conf|/etc/conf.d/*|/etc/host.conf)
+                info "legacy: $f still holds the old script's content (no pristine copy found)" ;;
+            *)  fail "legacy: $f still holds the old script's content and no pristine copy was found" ;;
+            esac
+        fi
+    done
+    for e in /etc/profile.d/bash_history.sh:6af75c770b18d579 /etc/cron.d/aide-check:f11ed3798a047dfa \
+             /etc/ssh/sshd_config.d/10-hardening.conf:7726c5006c3f4c14 /etc/modprobe.d/uncommon-filesystems.conf:a18e55c7b7c9ad79 \
+             /etc/modprobe.d/uncommon-net-protocols.conf:8eb7e1b76422a273 /etc/modprobe.d/blacklist-firewire.conf:9ea2fe8930583000; do
+        f=${e%%:*} h=${e#*:}
+        [ -f "$f" ] && [ "$(sha256sum < "$f" | cut -c1-16)" = "$h" ] && rm -f "$f" && pass "legacy: removed $f"
+    done
+    local -a units=()
+    for f in /etc/systemd/system/*.service.d/hardening.conf; do
+        [ -f "$f" ] && grep -q '^MemoryDenyWriteExecute=yes' "$f" && grep -q '^RemoveIPC=yes' "$f" || continue
+        rm -f "$f"; rmdir "${f%/*}" 2>/dev/null
+        f=${f#/etc/systemd/system/}; units+=("${f%.d/hardening.conf}")
+    done
+    if [ "${#units[@]}" -gt 0 ]; then
+        pass "legacy: removed blanket sandbox overrides from ${units[*]}"
+        if [ "$IN_CHROOT" = 0 ] && [ "$INIT" = systemd ]; then
+            systemctl daemon-reload && systemctl try-restart "${units[@]}" >/dev/null 2>&1
+        fi
+    fi
+}
+
+do_modules() {
+    local inuse fs out="" kept=""
+    inuse=" $({ findmnt -rno FSTYPE; findmnt --fstab -rno FSTYPE; } 2>/dev/null | sort -u | tr '\n' ' ') "
+    for fs in cramfs freevxfs jffs2 hfs hfsplus adfs affs befs bfs efs hpfs jfs minix nilfs2 omfs qnx4 qnx6 sysv ufs gfs2 ocfs2 reiserfs; do
+        case $inuse in *" $fs "*) kept+=" $fs"; continue ;; esac
+        out+="install $fs /bin/false"$'\n'
+    done
+    printf '%s' "$out" | put 644 /etc/modprobe.d/uncommon-filesystems.conf &&
+    printf 'install %s /bin/false\n' dccp sctp rds tipc n-hdlc ax25 netrom x25 rose decnet econet af_802154 ipx appletalk psnap p8023 p8022 can atm |
+        put 644 /etc/modprobe.d/uncommon-net-protocols.conf &&
+    printf 'blacklist %s\n' firewire-core firewire-ohci firewire-net firewire-serial firewire-sbp2 |
+        put 644 /etc/modprobe.d/blacklist-firewire.conf &&
+    pass "modules: rare filesystems and network protocols blocked, FireWire not autoloaded (squashfs, udf, f2fs untouched)" ||
+    fail "modules: could not write /etc/modprobe.d"
+    [ -n "$kept" ] && info "in use, left loadable:$kept"
+}
+
+do_coredumps() {
+    printf '%s\n' '# hardening.sh' '* hard core 0' | put 644 /etc/security/limits.d/90-hardening.conf &&
+        pass "core dumps: hard limit 0 for non-root users"
+    if [ -x /usr/lib/systemd/systemd-coredump ] || [ -x /lib/systemd/systemd-coredump ]; then
+        printf '%s\n' '[Coredump]' 'Storage=none' 'ProcessSizeMax=0' | put 644 /etc/systemd/coredump.conf.d/90-hardening.conf &&
+            pass "systemd-coredump: storage disabled"
+    fi
+}
+
+do_shell() {
+    if grep -Eq '^[[:space:]]*umask[[:space:]]+0?0?22[[:space:]]*$' /etc/profile 2>/dev/null; then
+        edit /etc/profile -E 's/^([[:space:]]*umask[[:space:]]+)0?0?22[[:space:]]*$/\1027/'
+    fi
+    put 644 /etc/profile.d/hardening.sh <<EOF
+# hardening.sh
+umask 027
+export HISTCONTROL=ignoreboth
+if [ "\$(id -u)" -eq 0 ] || [ -n "\${SSH_CONNECTION:-}" ] || tty 2>/dev/null | grep -q '^/dev/tty[0-9]'; then
+    case \$(readonly -p) in
+        *' TMOUT'[=\ ]*) ;;
+        *)
+            TMOUT=$TMOUT_SECONDS
+            readonly TMOUT
+            export TMOUT
+            ;;
+    esac
+fi
+EOF
+    pass "shell: umask 027, ${TMOUT_SECONDS}s idle logout on TTY/SSH/root shells only, space-prefixed commands kept out of history"
+}
+
+do_logindefs() {
+    local f=/etc/login.defs
+    [ -f "$f" ] || { skip "login.defs: not present"; return; }
+    set_def "$f" UMASK 027
+    set_def "$f" HOME_MODE 0700
+    set_def "$f" PASS_MAX_DAYS 99998
+    set_def "$f" PASS_MIN_DAYS 1
+    if yescrypt_ok; then
+        set_def "$f" ENCRYPT_METHOD YESCRYPT
+        set_def "$f" YESCRYPT_COST_FACTOR "$YESCRYPT_COST"
+    fi
+    grep -Eq '^[[:space:]]*CONSOLE_GROUPS[[:space:]]' "$f" && edit "$f" -E 's/^([[:space:]]*CONSOLE_GROUPS[[:space:]])/#\1/'
+    pass "login.defs: UMASK 027, HOME_MODE 0700, PASS_MAX_DAYS 99998, yescrypt cost $YESCRYPT_COST, CONSOLE_GROUPS off"
+}
+
+pam_wheel_on() {
+    local f=$1
+    [ -f "$f" ] || return 0
+    grep -Eq '^[[:space:]]*auth[[:space:]]+(include|substack)[[:space:]]+su[[:space:]]*$' "$f" && return 0
+    if ! grep -Eq '^[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_wheel\.so' "$f"; then
+        if grep -Eq '^#[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_wheel\.so' "$f"; then
+            edit "$f" -E '0,/^#[[:space:]]*(auth[[:space:]]+required[[:space:]]+pam_wheel\.so)/s//\1/'
+        else
+            save "$f"; printf 'auth\t\trequired\tpam_wheel.so use_uid\n' >> "$f"
+        fi
+    fi
+    grep -Eq '^[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_wheel\.so.*use_uid' "$f" ||
+        edit "$f" -E '/^[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_wheel\.so/s/$/ use_uid/'
+}
+
+pam_rehash() {
+    local f=$1 tmp
+    tmp=$(mktemp) || return 1
+    sed -E "/^[[:space:]]*password[[:space:]].*pam_unix\.so/{
+s/[[:space:]](md5|bigcrypt|sha256|sha512|blowfish|gost_yescrypt|yescrypt)([[:space:]]|\$)/ yescrypt\2/
+/[[:space:]]yescrypt([[:space:]]|\$)/!s/\$/ yescrypt/
+s/[[:space:]]rounds=[0-9]+//
+s/\$/ rounds=$YESCRYPT_COST/
+}" "$f" > "$tmp"
+    if cmp -s "$tmp" "$f"; then rm -f "$tmp"; return 0; fi
+    save "$f"; cat "$tmp" > "$f"; rm -f "$tmp"
+}
+
+do_pam() {
+    local f wgid members mod old
+    if [ -d /etc/security ]; then
+        [ -f /etc/security/faillock.conf ] || { save /etc/security/faillock.conf; : > /etc/security/faillock.conf; }
+        set_kv /etc/security/faillock.conf deny 5
+        set_kv /etc/security/faillock.conf unlock_time 900
+        set_kv /etc/security/faillock.conf fail_interval 900
+        if grep -Eqs '^[[:space:]]*-?auth[[:space:]].*pam_faillock\.so' /etc/pam.d/*; then pass "faillock: 5 failures in 15 min lock the account for 15 min"
+        else fail "faillock: settings written, but no /etc/pam.d stack loads pam_faillock.so, so failures are not counted"; fi
+    fi
+
+    getent group wheel >/dev/null || groupadd wheel
+    if [ -n "$ADMIN" ] && ! id -nG "$ADMIN" 2>/dev/null | tr ' ' '\n' | grep -qx wheel; then
+        usermod -aG wheel "$ADMIN" && pass "wheel: added $ADMIN"
+    fi
+    wgid=$(getent group wheel | cut -d: -f3)
+    members=$(getent group wheel | cut -d: -f4)
+    [ -n "$members" ] || members=$(awk -F: -v g="$wgid" '$4 == g { print $1; exit }' /etc/passwd)
+    if [ -n "$members" ]; then
+        pam_wheel_on /etc/pam.d/su && pam_wheel_on /etc/pam.d/su-l && pass "su: limited to wheel ($members), covers both 'su' and 'su -'"
+    else
+        fail "su: wheel has no members and the invoking user is unknown; pam_wheel left off to avoid locking su"
+    fi
+
+    if yescrypt_ok; then
+        for f in /etc/pam.d/*; do
+            [ -f "$f" ] && grep -Eq '^[[:space:]]*password[[:space:]].*pam_unix\.so' "$f" && pam_rehash "$f"
+        done
+        pass "PAM: new passwords hashed with yescrypt cost $YESCRYPT_COST"
+        old=$(awk -F: '$2 ~ /^\$(1|5|6|2[aby])\$/ { printf "%s ", $1 }' /etc/shadow 2>/dev/null)
+        [ -n "$old" ] && info "still on old hashes until their next password change: $old"
+    else
+        skip "PAM: libcrypt without yescrypt, hashing left as is"
+    fi
+
+    mod=$(find /usr/lib/security /usr/lib64/security /lib/security /usr/lib/x86_64-linux-gnu/security /lib/x86_64-linux-gnu/security \
+          -maxdepth 1 -name pam_pwquality.so 2>/dev/null | head -1)
+    f=/etc/pam.d/passwd
+    if [ -z "$mod" ]; then
+        skip "pwquality: pam_pwquality.so not installed"
+    else
+        [ -f /etc/security/pwquality.conf ] || { save /etc/security/pwquality.conf; : > /etc/security/pwquality.conf; }
+        set_kv /etc/security/pwquality.conf minlen 12
+        if grep -Eq '^[[:space:]]*password[[:space:]].*pam_(pwquality|cracklib|passwdqc)\.so' "$f" 2>/dev/null; then
+            pass "pwquality: minlen 12 (module already in $f)"
+        elif [ "$(grep -Ec '^[[:space:]]*password[[:space:]].*pam_unix\.so' "$f" 2>/dev/null)" = 1 ]; then
+            edit "$f" -E '/^[[:space:]]*password[[:space:]].*pam_unix\.so/{
+i\password\trequisite\tpam_pwquality.so retry=3
+/use_authtok/!s/$/ use_authtok/
+}'
+            pass "pwquality: new passwords need 12+ characters and fail on dictionary words"
+        else
+            skip "pwquality: $f layout not recognised, module not wired in"
+        fi
+    fi
+}
+
+do_shells() {
+    local u uid sh n=0
+    while IFS=: read -r u _ uid _ _ _ sh; do
+        [ "$uid" -eq 0 ] 2>/dev/null || { [ "$uid" -ge 1000 ] 2>/dev/null && [ "$uid" -lt 65534 ]; } || continue
+        case $sh in ""|*/nologin|*/false) continue ;; esac
+        [ -x "$sh" ] && ! grep -qxF "$sh" /etc/shells || continue
+        save /etc/shells; printf '%s\n' "$sh" >> /etc/shells
+        pass "shells: added $sh for $u (pam_shells rejects logins with unlisted shells)"; n=$((n + 1))
+    done < /etc/passwd
+    [ "$n" = 0 ] && pass "shells: every login shell in use is listed in /etc/shells"
+}
+
+do_homes() {
+    local u uid home n=0
+    while IFS=: read -r u _ uid _ _ home _; do
+        [ "$uid" -ge 1000 ] 2>/dev/null && [ "$uid" -lt 65534 ] && [ -d "$home" ] || continue
+        case $home in /home/?*|/var/home/?*) ;; *) continue ;; esac
+        [ $((8#$(stat -c %a "$home") & 7)) -eq 0 ] && continue
+        set_mode o-rwx "$home" && n=$((n + 1))
+    done < /etc/passwd
+    pass "homes: other-user access removed on $n home directories, new homes created 0700"
+}
+
+allow_list() {
+    local f=$1 bin grp
+    bin=$(command -v "$2") || return 1
+    if [ -n "$ADMIN" ]; then printf 'root\n%s\n' "$ADMIN"; else printf 'root\n'; fi | put 600 "$f"
+    grp=$(stat -c %G "$bin")
+    [ "$grp" != root ] && chgrp "$grp" "$f" && chmod 640 "$f"
+    [ -f "${f%.allow}.deny" ] && { save "${f%.allow}.deny"; rm -f "${f%.allow}.deny"; }
+    return 0
+}
+
+do_cron() {
+    local f
+    if allow_list /etc/cron.allow crontab; then
+        set_mode 600 /etc/crontab
+        set_mode 700 /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly
+        while IFS= read -r -d '' f; do set_mode go-rwx "$f"; done < <(find /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly -type f -print0 2>/dev/null)
+        pass "cron: crontab limited to root${ADMIN:+ and $ADMIN}"
+    fi
+    allow_list /etc/at.allow at && pass "at: limited to root${ADMIN:+ and $ADMIN}"
+    return 0
+}
+
+do_netprivacy() {
+    local f v
+    if [ -d /etc/NetworkManager ]; then
+        put 644 /etc/NetworkManager/conf.d/90-hardening.conf <<'EOF'
+# hardening.sh
+[connection]
+ipv4.dhcp-send-hostname=0
+ipv6.dhcp-send-hostname=0
+ipv4.dhcp-client-id=mac
+ipv6.ip6-privacy=2
+EOF
+        v=$(NetworkManager --version 2>/dev/null)
+        if [ -n "$v" ] && ! ver_ge "$v" 1.52; then
+            fail "NetworkManager $v ignores a global dhcp-send-hostname default (1.52+); run: nmcli connection modify <name> ipv4.dhcp-send-hostname no"
+        else
+            pass "NetworkManager: DHCP stops sending the hostname, client-id follows the randomized MAC (next reconnect)"
+        fi
+    fi
+    f=/etc/dhcpcd.conf
+    if [ -f "$f" ] && ! grep -Eq '^[[:space:]]*anonymous([[:space:]]|$)' "$f"; then
+        if grep -Eq '^[[:space:]]*(interface|ssid|profile|arping)[[:space:]]' "$f"; then
+            edit "$f" -E '0,/^[[:space:]]*(interface|ssid|profile|arping)[[:space:]]/s//anonymous\n&/'
+        else
+            save "$f"; printf 'anonymous\n' >> "$f"
+        fi
+    fi
+    [ -f "$f" ] && pass "dhcpcd: RFC 7844 anonymity profile (no hostname, DUID or vendor class)"
+    for f in /etc/dhcp/dhclient.conf /etc/dhclient.conf; do
+        [ -f "$f" ] && grep -Eq '^[[:space:]]*send[[:space:]]+host-name' "$f" &&
+            edit "$f" -E 's/^([[:space:]]*send[[:space:]]+host-name)/#\1/' && pass "dhclient: hostname no longer sent ($f)"
+    done
+    f=/etc/avahi/avahi-daemon.conf
+    if [ -f "$f" ] && [ "$MDNS_PUBLISH" = no ]; then
+        if ! grep -Eq '^[[:space:]]*disable-publishing[[:space:]]*=[[:space:]]*yes' "$f"; then
+            if grep -Eq '^[[:space:]]*#?[[:space:]]*disable-publishing[[:space:]]*=' "$f"; then
+                edit "$f" -E 's/^[[:space:]]*#?[[:space:]]*disable-publishing[[:space:]]*=.*/disable-publishing=yes/'
+            elif grep -q '^\[publish\]' "$f"; then
+                edit "$f" '/^\[publish\]/a disable-publishing=yes'
+            else
+                save "$f"; printf '\n[publish]\ndisable-publishing=yes\n' >> "$f"
+            fi
+        fi
+        pass "avahi: query-only, hostname no longer announced (next avahi restart)"
+    fi
+}
+
+LOCK=0 DNS_UIDS="" SSH_PORTS="" SSH_SRC4="" SSH_SRC6=""
+
+nets() {
+    local n
+    for n in $LAN_NETS; do
+        case $n in *:*) [ "$1" = 6 ] && echo "$n" ;; *) [ "$1" = 4 ] && echo "$n" ;; esac
+    done
+}
+
+rules_in() {
+    local fam=$1 n p s
+    echo "-A INPUT -p tcp ! --syn -m conntrack --ctstate NEW -j DROP"
+    echo "-A INPUT -p tcp --syn -m hashlimit --hashlimit-mode srcip --hashlimit-above 20/sec --hashlimit-burst 40 --hashlimit-name syn$fam -j DROP"
+    if [ "$fam" = 4 ]; then s=$SSH_SRC4; else s=$SSH_SRC6; fi
+    for n in $s; do
+        for p in $SSH_PORTS; do
+            echo "-A INPUT -s $n -p tcp --dport $p -m conntrack --ctstate NEW -m recent --name ssh$fam --set"
+            echo "-A INPUT -s $n -p tcp --dport $p -m conntrack --ctstate NEW -m recent --name ssh$fam --update --seconds 60 --hitcount 4 -j DROP"
+            echo "-A INPUT -s $n -p tcp --dport $p -j ACCEPT"
+        done
+    done
+    for n in $(nets "$fam"); do
+        for p in $LAN_TCP; do echo "-A INPUT -s $n -p tcp --dport $p -j ACCEPT"; done
+        for p in $LAN_UDP; do echo "-A INPUT -s $n -p udp --dport $p -j ACCEPT"; done
+        if [ "$fam" = 4 ]; then
+            echo "-A INPUT -s $n -p icmp --icmp-type echo-request -m limit --limit 5/sec -j ACCEPT"
+        else
+            echo "-A INPUT -s $n -p ipv6-icmp --icmpv6-type echo-request -m limit --limit 5/sec -j ACCEPT"
+        fi
+    done
+    for p in $PUBLIC_TCP; do echo "-A INPUT -p tcp --dport $p -j ACCEPT"; done
+    for p in $PUBLIC_UDP; do echo "-A INPUT -p udp --dport $p -j ACCEPT"; done
+    [ "$fam" = 4 ] && echo "-A INPUT -m addrtype --dst-type BROADCAST -j DROP"
+    echo "-A INPUT -m addrtype --dst-type MULTICAST -j DROP"
+    echo "-A INPUT -m limit --limit 6/min --limit-burst 10 -j LOG --log-prefix \"fw$fam-drop: \""
+}
+
+rules_lock() {
+    local u rej=icmp-port-unreachable
+    [ "$LOCK" = 1 ] || return 0
+    [ "$1" = 6 ] && rej=icmp6-port-unreachable
+    echo "-A OUTPUT -j dns-lock"
+    echo "-A dns-lock -o lo -j RETURN"
+    echo "-A dns-lock -o tun+ -j RETURN"
+    echo "-A dns-lock -o wg+ -j RETURN"
+    for u in $DNS_UIDS; do echo "-A dns-lock -m owner --uid-owner $u -j RETURN"; done
+    echo "-A dns-lock -p udp --dport 53 -j REJECT --reject-with $rej"
+    echo "-A dns-lock -p tcp --dport 53 -j REJECT --reject-with tcp-reset"
+    echo "-A dns-lock -p tcp --dport 853 -j REJECT --reject-with tcp-reset"
+}
+
+rules_v4() {
+    printf '%s\n' '*filter' ':INPUT DROP [0:0]' ':FORWARD DROP [0:0]' ':OUTPUT ACCEPT [0:0]'
+    [ "$LOCK" = 1 ] && echo ':dns-lock - [0:0]'
+    printf '%s\n' '-A INPUT -i lo -j ACCEPT' '-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT' \
+        '-A INPUT -m conntrack --ctstate INVALID -j DROP'
+    rules_in 4
+    rules_lock 4
+    echo COMMIT
+}
+
+rules_v6() {
+    local t
+    echo '*filter'
+    if [ "$IPV6" = block ]; then
+        printf '%s\n' ':INPUT DROP [0:0]' ':FORWARD DROP [0:0]' ':OUTPUT DROP [0:0]' \
+            '-A INPUT -i lo -j ACCEPT' '-A OUTPUT -o lo -j ACCEPT' '-A OUTPUT -p ipv6-icmp -j DROP' \
+            '-A OUTPUT -p tcp -j REJECT --reject-with tcp-reset' '-A OUTPUT -j REJECT --reject-with icmp6-adm-prohibited' COMMIT
+        return
+    fi
+    printf '%s\n' ':INPUT DROP [0:0]' ':FORWARD DROP [0:0]' ':OUTPUT ACCEPT [0:0]'
+    [ "$LOCK" = 1 ] && echo ':dns-lock - [0:0]'
+    printf '%s\n' '-A INPUT -i lo -j ACCEPT' '-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT'
+    for t in router-advertisement neighbour-solicitation neighbour-advertisement; do
+        echo "-A INPUT -p ipv6-icmp --icmpv6-type $t -m hl --hl-eq 255 -j ACCEPT"
+    done
+    printf '%s\n' '-A INPUT -s fe80::/10 -p ipv6-icmp --icmpv6-type 130 -j ACCEPT' \
+        '-A INPUT -m conntrack --ctstate INVALID -j DROP' \
+        '-A INPUT -s fe80::/10 -p udp --sport 547 --dport 546 -j ACCEPT'
+    rules_in 6
+    rules_lock 6
+    echo COMMIT
+}
+
+persist_fw() {
+    local svc=$1 rules=$2 bin=$3 conf sv dst
+    if [ "$INIT" = openrc ]; then
+        conf=$(sed -n -E 's/^[[:space:]]*IP6?TABLES_SAVE="?([^"]*)"?.*/\1/p' "/etc/conf.d/$svc" 2>/dev/null | tail -1)
+        [ -n "$conf" ] && [ "$conf" != "$rules" ] && put 600 "$conf" < "$rules"
+    fi
+    if enable_service "$svc"; then pass "firewall: $svc restores $rules at boot ($INIT)"; return; fi
+    case $INIT in
+        systemd)
+            put 644 "/etc/systemd/system/$svc-restore.service" <<EOF
 [Unit]
-Description=Restore $family firewall rules (installed by hardening script)
+Description=Restore $svc rules (hardening.sh)
 DefaultDependencies=no
-Before=network-pre.target
+Before=network-pre.target shutdown.target
 Wants=network-pre.target
 Conflicts=shutdown.target
-Before=shutdown.target
 
 [Service]
 Type=oneshot
-ExecStart=$restore_bin $rules_file
+ExecStart=$bin $rules
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
-            chmod 644 "/etc/systemd/system/${svc}-restore.service"
-            systemctl daemon-reload
-            systemctl enable "${svc}-restore.service" >/dev/null 2>&1 || true
-        fi
-    elif [ "$INIT_SYSTEM" = "runit" ] && [ ! -d "/etc/runit/sv/$svc" ]; then
-        mkdir -p "/etc/runit/sv/${svc}-restore"
-        backup_file "/etc/runit/sv/${svc}-restore/run"
-        cat > "/etc/runit/sv/${svc}-restore/run" <<EOF
-#!/bin/sh
-# Restores $family firewall rules at boot (installed by hardening script).
-exec 2>&1
-$restore_bin $rules_file
-exec sleep infinity
-EOF
-        chmod 755 "/etc/runit/sv/${svc}-restore/run"
-        if [ -d /run/runit/service ]; then
-            ln -sf "/etc/runit/sv/${svc}-restore" /run/runit/service 2>/dev/null || true
-        fi
-    else
-        enable_boot_service "$svc" default
-    fi
+            systemctl daemon-reload >/dev/null 2>&1
+            systemctl enable "$svc-restore.service" >/dev/null 2>&1 && pass "firewall: $svc-restore.service restores $rules at boot" ||
+                fail "firewall: could not enable $svc-restore.service" ;;
+        runit)
+            sv=/etc/runit/sv; [ -d "$sv" ] || sv=/etc/sv
+            printf '#!/bin/sh\nexec 2>&1\n%s %s\nexec sleep infinity\n' "$bin" "$rules" | put 755 "$sv/$svc-restore/run"
+            for dst in /run/runit/service /var/service /etc/runit/runsvdir/default; do
+                [ -d "$dst" ] && { ln -sfn "$sv/$svc-restore" "$dst/$svc-restore"; pass "firewall: runit $svc-restore restores $rules at boot"; return; }
+            done
+            fail "firewall: no runit service directory to enable $svc-restore" ;;
+        *)
+            fail "firewall: could not enable $svc under $INIT, rules will not survive a reboot" ;;
+    esac
 }
 
-if ! have_cmd "$IPTABLES"; then
-    warn "iptables not found at $IPTABLES — skipping firewall configuration entirely"
-else
+do_firewall() {
+    local r4 r6 err before="" f4=/etc/iptables/iptables.rules f6=/etc/iptables/ip6tables.rules ipt ip6t
+    ipt=$(command -v iptables-restore) || { fail "firewall: iptables-restore not found"; return; }
+    ip6t=$(command -v ip6tables-restore || true)
+    if { have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; } || { have ufw && ufw status 2>/dev/null | grep -q 'Status: active'; }; then
+        fail "firewall: firewalld or ufw is active, iptables ruleset not applied"; return
+    fi
 
-# Safety net: revert to a fully open firewall if setup fails partway
-# through, instead of leaving a half-built default-DROP state in place.
-# shellcheck disable=SC2317  # only invoked indirectly via `trap`, below
-firewall_panic() {
-    warn "Firewall setup did not finish — reverted to ACCEPT-all (v4+v6) so you are not locked out. Fix the underlying issue and re-run."
-    for t in "$IPTABLES" "$IP6TABLES"; do
-        have_cmd "$t" || continue
-        "$t" -P INPUT ACCEPT 2>/dev/null || true
-        "$t" -P FORWARD ACCEPT 2>/dev/null || true
-        "$t" -P OUTPUT ACCEPT 2>/dev/null || true
-        "$t" -F 2>/dev/null || true
-        "$t" -X 2>/dev/null || true
-    done
+    if [ "$SSH_FROM" != none ] && [ -x "$SSHD" ]; then
+        if [ -n "$SSH_PORT" ]; then SSH_PORTS=$SSH_PORT
+        else SSH_PORTS=$(sshd_check -T 2>/dev/null | awk '$1 == "port" { print $2 }' | sort -u | xargs); fi
+        [ -n "$SSH_PORTS" ] || SSH_PORTS=22
+        if [ "$SSH_FROM" = lan ]; then SSH_SRC4=$(nets 4); SSH_SRC6=$(nets 6)
+        else SSH_SRC4=0.0.0.0/0; SSH_SRC6=::/0; fi
+    fi
+
+    if [ "$DNS_LOCK" != no ]; then
+        if awk '$1 == "nameserver" { n++; if ($2 !~ /^127\./ && $2 != "::1") bad = 1 } END { exit !(n > 0 && !bad) }' /etc/resolv.conf 2>/dev/null &&
+           { [ "$DNS_LOCK" = yes ] || pgrep -x dnscrypt-proxy >/dev/null; }; then
+            DNS_UIDS=$(ps -o uid= -C dnscrypt-proxy,dnsmasq,unbound 2>/dev/null | tr -d ' ' | sort -u | tr '\n' ' ')
+            LOCK=1
+        elif [ "$DNS_LOCK" = yes ]; then
+            fail "firewall: DNS lock skipped, resolv.conf points at non-loopback nameservers"
+        fi
+    fi
+
+    r4=$(mktemp) && r6=$(mktemp) || return
+    rules_v4 > "$r4"; rules_v6 > "$r6"
+    if ! err=$("$ipt" --test < "$r4" 2>&1); then fail "firewall: IPv4 ruleset rejected: $err"; rm -f "$r4" "$r6"; return; fi
+    if [ -n "$ip6t" ] && ! err=$("$ip6t" --test < "$r6" 2>&1); then
+        if [ -e /proc/sys/net/ipv6 ]; then fail "firewall: IPv6 ruleset rejected: $err"; rm -f "$r4" "$r6"; return; fi
+        info "firewall: IPv6 disabled in this kernel, ip6tables skipped"; ip6t=""
+    fi
+    put 600 "$f4" < "$r4"
+    [ -n "$ip6t" ] && put 600 "$f6" < "$r6"
+    rm -f "$r4" "$r6"
+
+    if [ "$IN_CHROOT" = 0 ]; then
+        before=$(iptables -S 2>/dev/null)
+        if "$ipt" < "$f4" && { [ -z "$ip6t" ] || "$ip6t" < "$f6"; }; then
+            pass "firewall: live, inbound default-drop, IPv6 $IPV6 (filter table only; nat/mangle untouched)"
+        else
+            fail "firewall: live apply failed"
+        fi
+        case $before in *DOCKER*|*LIBVIRT*|*incus*|*CNI-*) info "restart docker/libvirt/incus: their filter chains were replaced" ;; esac
+        if have fail2ban-client && fail2ban-client ping >/dev/null 2>&1; then
+            if fail2ban-client reload --restart --all >/dev/null 2>&1; then pass "fail2ban: jails restarted, chains re-created, bans restored"
+            else fail "fail2ban: 'fail2ban-client reload --restart --all' failed, bans are not enforced"; fi
+        fi
+    fi
+    info "inbound: ssh ${SSH_PORTS:-closed}${SSH_PORTS:+ from $SSH_FROM}; LAN ${LAN_NETS:-none}; public tcp ${PUBLIC_TCP:-none} udp ${PUBLIC_UDP:-none}"
+    [ "$LOCK" = 1 ] && info "DNS lock on (exempt uids: ${DNS_UIDS:-none}); disable until reboot or re-run with: iptables -F dns-lock"
+    if have nft && nft list tables 2>/dev/null | grep -Evq '^table (ip|ip6) (filter|nat|mangle|raw|security)$'; then
+        info "other nftables tables are loaded; a packet must pass them too: $(nft list tables 2>/dev/null | tr '\n' ' ')"
+    fi
+    persist_fw iptables "$f4" "$ipt"
+    [ -n "$ip6t" ] && persist_fw ip6tables "$f6" "$ip6t"
 }
-trap firewall_panic ERR INT TERM
 
-status "flushing existing iptables rules"
-# Policies forced to ACCEPT before flushing, so a re-run (where policy is
-# already DROP from last time) never leaves a zero-rule DROP window.
-"$IPTABLES" -P INPUT ACCEPT
-"$IPTABLES" -P FORWARD ACCEPT
-"$IPTABLES" -P OUTPUT ACCEPT
-"$IPTABLES" -F
-"$IPTABLES" -X
-"$IPTABLES" -Z
-"$IPTABLES" -t nat -F
-"$IPTABLES" -t nat -X
-"$IPTABLES" -t nat -Z
-"$IPTABLES" -t mangle -F
-"$IPTABLES" -t mangle -X
-"$IPTABLES" -t mangle -Z
-ok
-
-status "creating logging chains"
-LOG="LOG --log-level debug --log-tcp-sequence --log-tcp-options --log-ip-options"
-RLIMIT="-m limit --limit 3/s --limit-burst 8"
-
-"$IPTABLES" -N LOGACCEPT
-# shellcheck disable=SC2086  # $LOG/$RLIMIT are meant to word-split into multiple args
-"$IPTABLES" -A LOGACCEPT -j $LOG $RLIMIT --log-prefix "ACCEPT "
-"$IPTABLES" -A LOGACCEPT -j ACCEPT
-
-"$IPTABLES" -N LOGDROP
-# shellcheck disable=SC2086  # intentional word-splitting, see LOGACCEPT above
-"$IPTABLES" -A LOGDROP -j $LOG $RLIMIT --log-prefix "DROP "
-"$IPTABLES" -A LOGDROP -j DROP
-
-"$IPTABLES" -N LOGREJECT
-# shellcheck disable=SC2086  # intentional word-splitting, see LOGACCEPT above
-"$IPTABLES" -A LOGREJECT -j $LOG $RLIMIT --log-prefix "REJECT "
-"$IPTABLES" -A LOGREJECT -p tcp -j REJECT --reject-with tcp-reset
-"$IPTABLES" -A LOGREJECT -j REJECT
-ok
-
-status "configuring loopback interface"
-"$IPTABLES" -A INPUT -i lo -j ACCEPT
-"$IPTABLES" -A OUTPUT -o lo -j ACCEPT
-ok
-
-status "configuring stateful firewall"
-"$IPTABLES" -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-"$IPTABLES" -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-ok
-
-status "blocking invalid packets"
-"$IPTABLES" -A INPUT -m conntrack --ctstate INVALID -j DROP
-"$IPTABLES" -A INPUT -p tcp --tcp-flags ALL NONE -j DROP
-"$IPTABLES" -A INPUT -p tcp --tcp-flags ALL ALL -j DROP
-"$IPTABLES" -A INPUT -p tcp ! --syn -m conntrack --ctstate NEW -j DROP
-ok
-
-status "implementing SYN flood protection"
-# Must run before any per-service allow rule, and in-budget traffic must
-# RETURN (not ACCEPT), or this silently turns into an accept-almost-
-# everything rule that bypasses the final catch-all reject.
-"$IPTABLES" -N SYNFLOOD
-"$IPTABLES" -A SYNFLOOD -m limit --limit 20/s --limit-burst 50 -j RETURN
-"$IPTABLES" -A SYNFLOOD -j LOGDROP
-"$IPTABLES" -A INPUT -p tcp --syn -j SYNFLOOD
-ok
-
-status "rate limiting ICMP"
-"$IPTABLES" -A INPUT -p icmp -m limit --limit 1/s --limit-burst 2 -j ACCEPT
-"$IPTABLES" -A INPUT -p icmp -j DROP
-ok
-
-status "allowing HTTP/HTTPS"
-"$IPTABLES" -A INPUT -p tcp --dport 80 -m conntrack --ctstate NEW -j ACCEPT
-"$IPTABLES" -A INPUT -p tcp --dport 443 -m conntrack --ctstate NEW -j ACCEPT
-ok
-
-status "allowing SSH with brute-force protection"
-"$IPTABLES" -A INPUT -p tcp --dport "$SSHPORT" -m conntrack --ctstate NEW -m recent --set --name SSH
-"$IPTABLES" -A INPUT -p tcp --dport "$SSHPORT" -m conntrack --ctstate NEW -m recent --update --seconds 60 --hitcount 4 --name SSH -j DROP
-"$IPTABLES" -A INPUT -p tcp --dport "$SSHPORT" -m conntrack --ctstate NEW -j ACCEPT
-ok
-
-status "allowing Tor network"
-"$IPTABLES" -A INPUT -p tcp -m multiport --dports 9050,9051,9150 -j ACCEPT
-ok
-
-status "allowing BitTorrent (P2P)"
-"$IPTABLES" -A INPUT -p tcp --dport 6881:6889 -j ACCEPT
-"$IPTABLES" -A INPUT -p udp --dport 6881:6889 -j ACCEPT
-ok
-
-status "allowing Steam gaming"
-"$IPTABLES" -A INPUT -p tcp --dport 27000:27100 -j ACCEPT
-"$IPTABLES" -A INPUT -p udp --dport 27000:27100 -j ACCEPT
-ok
-
-status "allowing console gaming (PlayStation/Xbox)"
-"$IPTABLES" -A INPUT -p tcp --dport 3478:3480 -j ACCEPT
-"$IPTABLES" -A INPUT -p udp --dport 3478:3480 -j ACCEPT
-ok
-
-status "logging dropped packets"
-"$IPTABLES" -A INPUT -m limit --limit 5/min -j LOG --log-prefix "iptables-input: " --log-level 7
-"$IPTABLES" -A FORWARD -m limit --limit 5/min -j LOG --log-prefix "iptables-forward: " --log-level 7
-ok
-
-status "setting final drop rules"
-"$IPTABLES" -A INPUT -j LOGREJECT
-"$IPTABLES" -A FORWARD -j LOGREJECT
-ok
-
-status "setting default policies"
-# Must run last, once every allow rule (incl. the catch-all reject) exists.
-"$IPTABLES" -P INPUT DROP
-"$IPTABLES" -P FORWARD DROP
-"$IPTABLES" -P OUTPUT ACCEPT
-"$IPTABLES" -t nat -P PREROUTING ACCEPT
-"$IPTABLES" -t nat -P OUTPUT ACCEPT
-"$IPTABLES" -t nat -P POSTROUTING ACCEPT
-"$IPTABLES" -t mangle -P PREROUTING ACCEPT
-"$IPTABLES" -t mangle -P INPUT ACCEPT
-"$IPTABLES" -t mangle -P FORWARD ACCEPT
-"$IPTABLES" -t mangle -P OUTPUT ACCEPT
-"$IPTABLES" -t mangle -P POSTROUTING ACCEPT
-ok
-
-status "saving iptables rules"
-mkdir -p /etc/iptables
-iptables-save > /etc/iptables/iptables.rules
-ok
-
-status "enabling iptables at boot"
-persist_firewall_boot "IPv4" iptables /etc/iptables/iptables.rules "$IPTABLES_RESTORE"
-ok
-
-# ========================================================
-# IPv6 FIREWALL
-# ========================================================
-print_section "IPv6 Firewall (Block All)"
-
-if ! have_cmd "$IP6TABLES"; then
-    warn "ip6tables not found at $IP6TABLES — skipping IPv6 firewall (if IPv6 is in use on this box, it is currently unfiltered)"
-else
-    status "configuring ip6tables (block all)"
-    "$IP6TABLES" -P INPUT ACCEPT
-    "$IP6TABLES" -P FORWARD ACCEPT
-    "$IP6TABLES" -P OUTPUT ACCEPT
-    "$IP6TABLES" -F
-    "$IP6TABLES" -X
-    "$IP6TABLES" -Z
-    "$IP6TABLES" -A INPUT -m limit --limit 5/min -j LOG --log-prefix "ip6tables-input: " --log-level 7
-    "$IP6TABLES" -A FORWARD -m limit --limit 5/min -j LOG --log-prefix "ip6tables-forward: " --log-level 7
-    "$IP6TABLES" -A OUTPUT -m limit --limit 5/min -j LOG --log-prefix "ip6tables-output: " --log-level 7
-    "$IP6TABLES" -P INPUT DROP
-    "$IP6TABLES" -P FORWARD DROP
-    "$IP6TABLES" -P OUTPUT DROP
-    mkdir -p /etc/iptables
-    ip6tables-save > /etc/iptables/ip6tables.rules
-    ok
-
-    status "enabling ip6tables at boot"
-    persist_firewall_boot "IPv6" ip6tables /etc/iptables/ip6tables.rules "$IP6TABLES_RESTORE"
-    ok
-fi
-
-# Ruleset complete and saved — clear the safety net.
-trap - ERR INT TERM
-
-fi # have_cmd iptables
-
-# ========================================================
-# SYSTEM CONFIGURATION FILES
-# ========================================================
-print_section "System Configuration Files"
-
-status "configuring bash environment"
-backup_file /etc/bash.bashrc
-cat > /etc/bash.bashrc <<'EOF'
-# /etc/bash.bashrc
-
-[[ $- != *i* ]] && return
-
-PS1='[\u@\h \W]\$ '
-PS2='> '
-PS3='> '
-PS4='+ '
-
-umask 0027
-
-# Auto-logout idle interactive shells after 30 minutes. This only closes
-# idle terminal *prompts* -- it has no effect on your desktop session,
-# running programs, or anything with a foreground job attached. Readonly
-# so a script (or an attacker with a foothold) can't just unset it to
-# cover their tracks. Comment out the "readonly" line, or raise the
-# value, if 30 minutes ever proves annoying.
-TMOUT=1800
-export TMOUT
-readonly TMOUT
-
-case ${TERM} in
-  xterm*|rxvt*|Eterm|aterm|kterm|gnome*)
-    PROMPT_COMMAND=${PROMPT_COMMAND:+$PROMPT_COMMAND; }'printf "\033]0;%s@%s:%s\007" "${USER}" "${HOSTNAME%%.*}" "${PWD/#$HOME/\~}"'
-    ;;
-  screen)
-    PROMPT_COMMAND=${PROMPT_COMMAND:+$PROMPT_COMMAND; }'printf "\033_%s@%s:%s\033\\" "${USER}" "${HOSTNAME%%.*}" "${PWD/#$HOME/\~}"'
-    ;;
-esac
-
-[ -r /usr/share/bash-completion/bash_completion ] && . /usr/share/bash-completion/bash_completion
-EOF
-ok
-
-status "configuring global profile"
-backup_file /etc/profile
-cat > /etc/profile <<'EOF'
-# /etc/profile
-
-umask 0027
-
-if [[ $UID == 0 ]]; then
-  export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-elif [[ $UID -ge 1000 ]]; then
-  export PATH="/usr/local/bin:/usr/bin:/bin"
-else
-  # System/service accounts: a minimal, sane PATH rather than none.
-  export PATH="/usr/local/bin:/usr/bin:/bin"
-fi
-
-if test -d /etc/profile.d/; then
-  for profile in /etc/profile.d/*.sh; do
-    test -r "$profile" && . "$profile"
-  done
-  unset profile
-fi
-
-if test "$PS1" && test "$BASH" && test -z ${POSIXLY_CORRECT+x} && test -r /etc/bash.bashrc; then
-  . /etc/bash.bashrc
-fi
-
-unset TERMCAP
-unset MANPATH
-EOF
-ok
-
-status "configuring bash history"
-backup_file /etc/profile.d/bash_history.sh
-cat > /etc/profile.d/bash_history.sh <<'EOF'
-export HISTTIMEFORMAT="%F %T "
-export HISTCONTROL=ignoredups
-export HISTFILE="$HOME/.bash_history"
-export HISTSIZE=1000
-export HISTFILESIZE=2000
-readonly HISTFILE
-readonly HISTSIZE
-readonly HISTFILESIZE
-EOF
-chmod +x /etc/profile.d/bash_history.sh
-ok
-
-status "configuring locale settings"
-backup_file /etc/locale.conf
-cat > /etc/locale.conf <<'EOF'
-LANG=en_GB.UTF-8
-LANGUAGE="en_GB:en_US"
-LC_CTYPE="C"
-LC_NUMERIC="C"
-LC_TIME="C"
-LC_COLLATE="C"
-LC_MONETARY="C"
-LC_PAPER="C"
-LC_NAME="C"
-LC_ADDRESS="C"
-LC_TELEPHONE="C"
-LC_MEASUREMENT="C"
-LC_IDENTIFICATION="C"
-EOF
-ok
-
-status "configuring environment"
-backup_file /etc/environment
-cat > /etc/environment <<'EOF'
-LANG="en_GB.UTF-8"
-LANGUAGE="en_GB:en_US"
-PAGER="less"
-EOF
-ok
-
-status "configuring console settings"
-backup_file /etc/vconsole.conf
-cat > /etc/vconsole.conf <<'EOF'
-KEYMAP=uk
-EOF
-ok
-
-status "configuring secure terminals"
-backup_file /etc/securetty
-cat > /etc/securetty <<'EOF'
-console
-tty1
-tty2
-tty3
-tty4
-tty5
-tty6
-ttyS0
-hvc0
-EOF
-ok
-
-status "configuring valid shells"
-backup_file /etc/shells
-cat > /etc/shells <<'EOF'
-/bin/sh
-/bin/bash
-/bin/rbash
-/bin/zsh
-/bin/rzsh
-EOF
-ok
-
-status "configuring login policies"
-backup_file /etc/login.defs
-cat > /etc/login.defs <<'EOF'
-# /etc/login.defs - Configuration control definitions for the login package
-
-# Password aging: technically configured (Lynis AUTH-9286 wants a real
-# finite value here) but set long enough it will never actually trigger
-# for a real person. PASS_MIN_DAYS 1 only blocks changing a password
-# twice in the same second to cycle through history -- no normal use
-# ever notices it.
-PASS_MAX_DAYS   3650
-PASS_MIN_DAYS   1
-PASS_WARN_AGE   7
-PASS_MIN_LEN    12
-
-# Login retries
-LOGIN_RETRIES   3
-LOGIN_TIMEOUT   60
-
-# User/group ID ranges
-UID_MIN                  1000
-UID_MAX                 60000
-SYS_UID_MIN               201
-SYS_UID_MAX               999
-GID_MIN                  1000
-GID_MAX                 60000
-SYS_GID_MIN               201
-SYS_GID_MAX               999
-
-# Umask for home directories
-UMASK           027
-
-# Create home directories by default
-CREATE_HOME     yes
-
-# Encrypt password method (use SHA-512)
-ENCRYPT_METHOD SHA512
-SHA_CRYPT_MIN_ROUNDS 5000
-SHA_CRYPT_MAX_ROUNDS 5000
-PASS_MAX_LEN 256
-
-# User groups
-USERGROUPS_ENAB yes
-
-# Delay after failed login (in seconds)
-FAIL_DELAY              3
-
-# Environment variables
-ENV_SUPATH      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ENV_PATH        PATH=/usr/local/bin:/usr/bin:/bin
-
-# Terminal permissions
-TTYGROUP        tty
-TTYPERM         0600
-
-# Enable setting of ulimit, umask, and niceness from passwd gecos field
-QUOTAS_ENAB     no
-
-# Enable setting of environment variables
-ENVIRON_FILE    /etc/environment
-
-# Login/logout logging
-SYSLOG_SU_ENAB          yes
-SYSLOG_SG_ENAB          yes
-
-# Console device protection
-CONSOLE         /etc/securetty
-CONSOLE_GROUPS  floppy:audio:cdrom
-
-# Mail directory
-MAIL_DIR        /var/spool/mail
-
-# Default PATH for su
-SU_NAME         su
-
-# Enable display of unknown usernames on failed login (kept off: avoids
-# leaking a mistyped password into the log via the username field)
-LOG_UNKFAIL_ENAB        no
-
-# Enable logging of successful logins
-LOG_OK_LOGINS           yes
-
-# Which fields may be changed by regular users using chfn
-CHFN_RESTRICT           rwh
-
-# Allow login even if the home directory is missing/unreachable, so a
-# transient mount problem can't lock you out of every account at once
-# (shadow-utils upstream default).
-DEFAULT_HOME    yes
-
-# Send mail to user when password is changed
-MAIL_CHECK_ENAB yes
-EOF
-ok
-
-status "configuring wireless regulatory domain"
-backup_file /etc/conf.d/wireless-regdom
-mkdir -p /etc/conf.d
-cat > /etc/conf.d/wireless-regdom <<'EOF'
-# Wireless regulatory domain configuration
-# Uncomment your region
-WIRELESS_REGDOM="00"
-#WIRELESS_REGDOM="GB"
-#WIRELESS_REGDOM="US"
-EOF
-ok
-
-status "configuring WPA supplicant"
-mkdir -p /etc/wpa_supplicant
-# Write-once: never overwrite a real configured network list.
-if [ -f /etc/wpa_supplicant/wpa_supplicant.conf ]; then
-    skip "already exists — left untouched so any configured networks aren't wiped"
-else
-    cat > /etc/wpa_supplicant/wpa_supplicant.conf <<'EOF'
-# WPA supplicant configuration
-# NOTE: This file may contain password information and should be
-# readable only by root on multiuser systems.
-
-ctrl_interface=/var/run/wpa_supplicant
-eapol_version=1
-ap_scan=1
-fast_reauth=1
-country=GB
-
-# Network configuration examples (uncomment and customize):
-#
-# WPA-PSK/WPA2-PSK with passphrase:
-#network={
-#  ssid="your_network_name"
-#  psk="your_passphrase"
-#  priority=5
-#}
-#
-# WPA-PSK/WPA2-PSK with pre-computed PSK:
-#network={
-#  ssid="your_network_name"
-#  psk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-#  priority=5
-#}
-EOF
-    ok
-fi
-chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null || true
-
-status "restricting su to wheel group"
-if have_cmd getent && ! getent group wheel >/dev/null 2>&1; then
-    groupadd wheel 2>/dev/null && info "  Created the 'wheel' group (none existed on this system)"
-fi
-if ! grep -q "auth required pam_wheel.so" /etc/pam.d/su 2>/dev/null; then
-  backup_file /etc/pam.d/su
-  echo "auth required pam_wheel.so use_uid" >> /etc/pam.d/su
-fi
-if have_cmd getent && [ -z "$(getent group wheel | cut -d: -f4)" ]; then
-    INVOKING_USER="${SUDO_USER:-}"
-    if [ -z "$INVOKING_USER" ] && have_cmd logname; then
-        INVOKING_USER="$(logname 2>/dev/null || true)"
-    fi
-    if [ -n "$INVOKING_USER" ] && [ "$INVOKING_USER" != "root" ] && id "$INVOKING_USER" >/dev/null 2>&1; then
-        usermod -aG wheel "$INVOKING_USER" 2>/dev/null \
-            && info "  Added '$INVOKING_USER' to the wheel group so su keeps working" \
-            || warn "Could not add '$INVOKING_USER' to the wheel group automatically — su may stop working for that user"
-    else
-        warn "no supplementary members currently listed in the 'wheel' group, and the invoking user couldn't be determined automatically (this check also can't see a user whose *primary* group is wheel, so ignore if that's you)"
-    fi
-fi
-ok
-
-status "configuring login banners"
-backup_file /etc/issue
-cat > /etc/issue <<'EOF'
-+---------------------------------------------------------------+
-| WARNING: Unauthorized access to this system is prohibited.    |
-| All connections are logged and monitored. Disconnect          |
-| IMMEDIATELY if you are not an authorized user!                |
-+---------------------------------------------------------------+
-EOF
-cp /etc/issue /etc/issue.net
-ok
-
-status "configuring locale generation"
-backup_file /etc/locale.gen
-cat > /etc/locale.gen <<'EOF'
-en_GB.UTF-8 UTF-8  
-en_GB ISO-8859-1  
-en_US.UTF-8 UTF-8  
-en_US ISO-8859-1  
-EOF
-ok
-
-status "configuring encrypted partitions"
-# Write-once: this is a template for your LUKS mappings.
-if [ -f /etc/crypttab ]; then
-    skip "already exists — left untouched"
-else
-    cat > /etc/crypttab <<'EOF'
-# crypttab: mappings for encrypted partitions
-#
-# Each mapped device will be created in /dev/mapper, so your /etc/fstab
-# should use the /dev/mapper/<name> paths for encrypted devices.
-#
-# NOTE: Do not list your root (/) partition here, it must be set up
-#       beforehand by the initramfs (/etc/mkinitcpio.conf).
-#
-# <name>       <device>         <password>              <options>
-# Example configurations (commented out - customize for your system):
-#home          /dev/vg0/lvhome  /etc/keys/home-key      cipher=serpent-xts-plain64:sha256,size=512
-#var           /dev/vg0/lvvar   /etc/keys/var-key       cipher=twofish-xts-plain64:sha256,size=256
-#swap          /dev/vg0/lvswap  /etc/keys/swap-key      cipher=twofish-xts-plain64:sha256,size=256
-EOF
-    ok
-fi
-
-status "configuring DHCP client security"
-if ! have_cmd dhclient; then
-    skip "dhclient not installed — this system likely uses dhcpcd/NetworkManager instead"
-elif [ -f /etc/dhclient.conf ]; then
-    skip "already exists — left untouched"
-else
-    cat > /etc/dhclient.conf <<'EOF'
-# DHCP client security configuration
-timeout 60;
-retry 60;
-reboot 10;
-select-timeout 5;
-initial-interval 2;
-
-# Example interface configuration (uncomment and customize):
-#interface "eth0" {
-#  send host-name "hostname";
-#  send dhcp-lease-time 3600;
-#  prepend domain-name-servers 127.0.0.1;
-#  request subnet-mask, broadcast-address, time-offset, routers,
-#    domain-name, domain-name-servers, host-name;
-#  require subnet-mask, domain-name-servers;
-#}
-EOF
-    ok
-fi
-
-status "configuring build hardening (makepkg)"
-# Assumes x86_64 (CARCH/CHOST below) — adjust for other architectures.
-backup_file /etc/makepkg.conf
-cat > /etc/makepkg.conf <<'EOF'
-# /etc/makepkg.conf
-
-DLAGENTS=('ftp::/usr/bin/curl -fC - --ftp-pasv --retry 3 --retry-delay 3 -o %o %u'
-          'http::/usr/bin/curl -fLC - --retry 3 --retry-delay 3 -o %o %u'
-          'https::/usr/bin/curl -fLC - --retry 3 --retry-delay 3 -o %o %u'
-          'rsync::/usr/bin/rsync --no-motd -z %u %o'
-          'scp::/usr/bin/scp -C %u %o')
-
-VCSCLIENTS=('bzr::bzr'
-            'git::git'
-            'hg::mercurial'
-            'svn::subversion')
-
-CARCH="x86_64"
-CHOST="x86_64-unknown-linux-gnu"
-
-CPPFLAGS="-D_FORTIFY_SOURCE=2"
-CFLAGS="-march=native -mtune=native -O2 -pipe -fstack-protector-strong"
-CXXFLAGS="-march=native -mtune=native -O2 -pipe -fstack-protector-strong"
-LDFLAGS="-Wl,-O1,--sort-common,--as-needed,-z,relro,-z,now"
-
-DEBUG_CFLAGS="-g -fvar-tracking-assignments"
-DEBUG_CXXFLAGS="-g -fvar-tracking-assignments"
-
-BUILDENV=(!distcc color !ccache check !sign)
-
-OPTIONS=(strip docs !libtool !staticlibs emptydirs zipman purge !optipng !upx !debug)
-
-INTEGRITY_CHECK=(sha256)
-STRIP_BINARIES="--strip-all"
-STRIP_SHARED="--strip-unneeded"
-STRIP_STATIC="--strip-debug"
-MAN_DIRS=({usr{,/local}{,/share},opt/*}/{man,info})
-DOC_DIRS=(usr/{,local/}{,share/}{doc,gtk-doc} opt/*/{doc,gtk-doc})
-PURGE_TARGETS=(usr/{,share}/info/dir .packlist *.pod)
-
-PKGEXT='.pkg.tar.xz'
-SRCEXT='.src.tar.gz'
-EOF
-ok
-
-# ========================================================
-# SSH CLIENT CONFIGURATION
-# ========================================================
-print_section "SSH Client Configuration"
-
-status "configuring SSH client"
-backup_file /etc/ssh/ssh_config
-mkdir -p /etc/ssh
-cat > /etc/ssh/ssh_config <<'EOF'
-Host *
-  ForwardAgent no
-  ForwardX11 no
-  PasswordAuthentication no
-  HostbasedAuthentication no
-  GSSAPIAuthentication no
-  GSSAPIDelegateCredentials no
-  CheckHostIP yes
-  AddressFamily any
-  ConnectTimeout 180
-  HashKnownHosts yes
-  StrictHostKeyChecking yes
-  IdentityFile ~/.ssh/id_ed25519
-  IdentityFile ~/.ssh/id_rsa
-  Port 22
-  KexAlgorithms curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256
-  Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
-  MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com,hmac-sha2-512,hmac-sha2-256,umac-128@openssh.com
-  VisualHostKey yes
-EOF
-ok
-
-# ========================================================
-# SSH SERVER CONFIGURATION
-# ========================================================
-# Written as a drop-in (delete the file to fully undo), validated with
-# `sshd -t` before being left in place, and never reloads/restarts sshd —
-# test from a second session before doing that yourself.
-print_section "SSH Server Configuration"
-
-status "hardening SSH server (sshd)"
-if [ ! -f /etc/ssh/sshd_config ]; then
-    skip "no /etc/ssh/sshd_config — openssh server doesn't look installed"
-else
-    if ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config 2>/dev/null; then
-        backup_file /etc/ssh/sshd_config
-        { printf 'Include /etc/ssh/sshd_config.d/*.conf\n'; cat /etc/ssh/sshd_config; } > /etc/ssh/sshd_config.new
-        mv /etc/ssh/sshd_config.new /etc/ssh/sshd_config
-        chmod 600 /etc/ssh/sshd_config
-    fi
-    mkdir -p /etc/ssh/sshd_config.d
-    cat > /etc/ssh/sshd_config.d/10-hardening.conf <<'EOF'
-# Dropped in by the hardening script — delete this one file to fully
-# revert just the SSH server changes without touching the rest of
-# sshd_config.
-#
-# Deliberately NOT set here: PasswordAuthentication. Once you've
-# confirmed key-based login works (test in a NEW terminal/session before
-# closing your current one!) you can add "PasswordAuthentication no" to
-# this file yourself.
-PermitRootLogin prohibit-password
+has_keys() {
+    local u uid home
+    while IFS=: read -r u _ uid _ _ home _; do
+        [ "$uid" -ge 1000 ] 2>/dev/null && [ "$uid" -lt 65534 ] || continue
+        grep -Eqs '(^|[[:space:]])(ssh-(ed25519|rsa)|ecdsa-sha2-nistp[0-9]+|sk-[a-z0-9-]+@openssh\.com)[[:space:]]+AAAA' "$home/.ssh/authorized_keys" && return 0
+    done < /etc/passwd
+    return 1
+}
+
+do_ssh() {
+    local cfg=/etc/ssh/sshd_config drop=/etc/ssh/sshd_config.d/10-hardening.conf pw="" err tmp
+    if [ -f "$cfg" ] && [ -x "$SSHD" ]; then
+        grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$cfg" || edit "$cfg" '1i Include /etc/ssh/sshd_config.d/*.conf'
+        case $SSH_PASSWORDS in
+            no) pw=no ;;
+            yes) pw=yes ;;
+            *) has_keys && pw=no ;;
+        esac
+        {
+            echo "# hardening.sh"
+            [ -n "$SSH_PORT" ] && echo "Port $SSH_PORT"
+            [ -n "$pw" ] && printf 'PasswordAuthentication %s\nKbdInteractiveAuthentication %s\n' "$pw" "$pw"
+            cat <<'EOF'
+PermitRootLogin no
 PermitEmptyPasswords no
 MaxAuthTries 4
+MaxSessions 4
+LoginGraceTime 30
+AllowAgentForwarding no
+AllowTcpForwarding local
 X11Forwarding no
-LogLevel VERBOSE
+TCPKeepAlive no
 ClientAliveInterval 300
 ClientAliveCountMax 2
+LogLevel VERBOSE
 Banner /etc/issue.net
+KexAlgorithms -ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group14-sha256,diffie-hellman-group14-sha1,diffie-hellman-group1-sha1
+MACs -umac-64-etm@openssh.com,umac-64@openssh.com,hmac-sha1-etm@openssh.com,hmac-sha1
 EOF
-    chmod 600 /etc/ssh/sshd_config.d/10-hardening.conf
-
-    if have_cmd sshd; then
-        if sshd -t 2>/tmp/sshd_test_err.$$; then
-            ok
+        } | put 600 "$drop"
+        if err=$(sshd_check -t); then
+            pass "sshd: drop-in valid (sshd -t); active after the next sshd reload"
+            case $pw in
+                no) pass "sshd: password and keyboard-interactive login off" ;;
+                "") info "sshd: password login left as configured, no user has ~/.ssh/authorized_keys yet" ;;
+            esac
         else
-            SSHD_ERR=$(cat /tmp/sshd_test_err.$$ 2>/dev/null)
-            rm -f /etc/ssh/sshd_config.d/10-hardening.conf
-            # If the error names a line in the main sshd_config, that was
-            # pre-existing — surface it directly instead of making you dig.
-            BADLINE=$(printf '%s' "$SSHD_ERR" | grep -oE '/etc/ssh/sshd_config line [0-9]+' | head -1 | grep -oE '[0-9]+$' || true)
-            if [ -n "$BADLINE" ]; then
-                OFFENDING=$(sed -n "${BADLINE}p" /etc/ssh/sshd_config 2>/dev/null)
-                warn "sshd -t failed because of a PRE-EXISTING line already in your sshd_config (line $BADLINE: '$OFFENDING') -- this has nothing to do with anything this script added. Reverted sshd_config.d/10-hardening.conf so sshd keeps working right now, but that line will also make sshd fail to (re)start the next time it's reloaded or the box reboots, regardless of this script. Fix or remove line $BADLINE, then re-run this script to pick the hardening back up. Full details: $SSHD_ERR"
-            else
-                warn "sshd -t rejected the new config — reverted sshd_config.d/10-hardening.conf so sshd still starts. Details: $SSHD_ERR"
-            fi
+            rm -f "$drop"; fail "sshd: drop-in rejected and removed: $err"
         fi
-        rm -f /tmp/sshd_test_err.$$
+        if [ -f /etc/ssh/moduli ]; then
+            tmp=$(mktemp) && awk '$5 >= 3071' /etc/ssh/moduli > "$tmp"
+            if [ -s "$tmp" ] && ! cmp -s "$tmp" /etc/ssh/moduli; then
+                save /etc/ssh/moduli; cat "$tmp" > /etc/ssh/moduli; pass "sshd: DH moduli below 3072 bits removed"
+            fi
+            rm -f "$tmp"
+        fi
+        set_mode 600 "$cfg"
     else
-        skip "sshd binary not found to validate against, but the config was written"
+        skip "sshd: not installed"
     fi
-fi
 
-# ========================================================
-# AIDE CONFIGURATION
-# ========================================================
-print_section "AIDE Intrusion Detection"
+    cfg=/etc/ssh/ssh_config drop=/etc/ssh/ssh_config.d/10-hardening.conf
+    if [ -f "$cfg" ] && have ssh; then
+        grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/ssh_config\.d/\*\.conf' "$cfg" || edit "$cfg" '1i Include /etc/ssh/ssh_config.d/*.conf'
+        printf '%s\n' '# hardening.sh' 'Host *' '    HashKnownHosts yes' '    ForwardAgent no' '    ForwardX11 no' | put 644 "$drop"
+        set_mode 644 "$cfg"
+        if ssh -G localhost >/dev/null 2>&1; then
+            pass "ssh client: known_hosts hashed, agent/X11 forwarding off, OpenSSH algorithm defaults kept"
+        else
+            rm -f "$drop"; fail "ssh client: config rejected by 'ssh -G', drop-in removed"
+        fi
+    fi
+}
 
-status "configuring AIDE"
-mkdir -p /var/lib/aide /var/log/aide
-backup_file /etc/aide.conf
-cat > /etc/aide.conf <<'EOF'
+do_banners() {
+    local b
+    b=$(printf '%s\n' \
+        '+---------------------------------------------------------------+' \
+        '| WARNING: Unauthorized access to this system is prohibited.    |' \
+        '| All connections are logged and monitored. Disconnect          |' \
+        '| IMMEDIATELY if you are not an authorized user!                |' \
+        '+---------------------------------------------------------------+')
+    printf '%s\n' "$b" | put 644 /etc/issue && printf '%s\n' "$b" | put 644 /etc/issue.net && pass "banners: /etc/issue, /etc/issue.net"
+}
+
+do_services() {
+    local s b found=0
+    if [ "$INIT" != systemd ]; then
+        for s in syslog-ng:syslog-ng rsyslog:rsyslogd socklog-unix:socklog; do
+            have "${s#*:}" || continue
+            found=1
+            if enable_service "${s%%:*}"; then pass "logging: ${s%%:*} enabled at boot"; else fail "logging: could not enable ${s%%:*}"; fi
+            break
+        done
+        [ "$found" = 1 ] || skip "logging: no syslog daemon installed"
+    fi
+    if have auditd; then
+        if enable_service auditd; then pass "auditd: enabled at boot"; else fail "auditd: could not enable"; fi
+    fi
+    for b in telnetd in.telnetd inetd xinetd in.tftpd tftpd in.rshd rshd in.rlogind rlogind in.rexecd rexecd ypbind; do
+        have "$b" && fail "legacy daemon installed: $b, remove its package"
+    done
+    return 0
+}
+
+do_perms() {
+    set_mode o-rwx /etc/shadow /etc/gshadow /etc/shadow- /etc/gshadow-
+    set_mode 644 /etc/passwd /etc/group
+    set_mode 700 /root /root/.ssh
+    [ -d /root/.ssh ] && find /root/.ssh -type f -exec chmod go-rwx {} +
+    set_mode 600 /etc/doas.conf /etc/crypttab /etc/wpa_supplicant/wpa_supplicant.conf /boot/grub/grub.cfg /boot/grub2/grub.cfg
+    [ -d /etc/ssl/private ] && chmod -R o-rwx /etc/ssl/private
+    pass "permissions: shadow, root home, doas.conf, crypttab, wpa_supplicant.conf, grub.cfg"
+}
+
+do_aide() {
+    local attrs="p+l+u+g+s" v err d dirs=""
+    have aide || { skip "aide: not installed"; return; }
+    v=$(aide --version 2>&1)
+    grep -q '^acl: yes' <<< "$v" && attrs+="+acl"
+    grep -q '^xattrs: yes' <<< "$v" && attrs+="+xattrs"
+    mkdir -p /var/lib/aide /var/log/aide && chmod 700 /var/lib/aide /var/log/aide
+    for d in /boot /usr /opt /root/.ssh; do [ -d "$d" ] && dirs+="${d//./\\.} FULL"$'\n'; done
+    put 600 /etc/aide.conf <<EOF
 @@define DBDIR /var/lib/aide
 @@define LOGDIR /var/log/aide
-
-database=file:@@{DBDIR}/aide.db.gz
+database_in=file:@@{DBDIR}/aide.db.gz
 database_out=file:@@{DBDIR}/aide.db.new.gz
 database_new=file:@@{DBDIR}/aide.db.new.gz
-
 gzip_dbout=yes
-verbose=5
-
+log_level=warning
+report_level=changed_attributes
 report_url=file:@@{LOGDIR}/aide.log
 report_url=stdout
 
-ALLXTRAHASHES = sha1+rmd160+sha256+sha512+tiger
-EVERYTHING = R+ALLXTRAHASHES
-NORMAL = R+rmd160+sha256
-DIR = p+i+n+u+g+acl+xattrs
-PERMS = p+i+u+g+acl
-LOG = >
-LSPP = R+sha256
-DATAONLY = p+n+u+g+s+acl+xattrs+md5+sha256+rmd160+tiger
+FULL = $attrs+i+n+m+c+sha512
+ETC = $attrs+sha512
 
-/boot NORMAL
-/bin NORMAL
-/sbin NORMAL
-/lib NORMAL
-/lib64 NORMAL
-/opt NORMAL
-/usr NORMAL
-/root NORMAL
+${dirs}/etc ETC
 !/usr/src
-!/usr/tmp
-
-/etc PERMS
-!/etc/mtab
-!/etc/.*~
-/etc/exports NORMAL
-/etc/fstab NORMAL
-/etc/passwd NORMAL
-/etc/group NORMAL
-/etc/gshadow NORMAL
-/etc/shadow NORMAL
-/etc/security/opasswd NORMAL
-/etc/hosts.allow NORMAL
-/etc/hosts.deny NORMAL
-/etc/sudoers NORMAL
-/etc/skel NORMAL
-/etc/logrotate.d NORMAL
-/etc/resolv.conf DATAONLY
-/etc/nscd.conf NORMAL
-/etc/securetty NORMAL
-/etc/profile NORMAL
-/etc/bash.bashrc NORMAL
-/etc/bash_completion.d/ NORMAL
-/etc/login.defs NORMAL
-
-!/var/lib/pacman/.*
-!/var/cache/.*
-!/var/log/.*
-!/var/run/.*
-!/var/spool/.*
+!/etc/mtab\$
+!/etc/adjtime\$
+!/etc/ld\.so\.cache\$
+!/etc/resolv\.conf\$
+!/etc/machine-id\$
+!/etc/hostname\$
+!/etc/pacman\.d/gnupg
+!/etc/\.
+!/etc/.*~\$
 EOF
-ok
-
-status "scheduling daily AIDE checks"
-if have_cmd aide; then
-    cat > /etc/cron.d/aide-check <<'EOF'
-# Daily AIDE integrity check, installed by the hardening script.
-0 3 * * * root [ -f /var/lib/aide/aide.db.gz ] && /usr/bin/aide --check >> /var/log/aide/aide-check.log 2>&1
-EOF
-    chmod 644 /etc/cron.d/aide-check
-    ok
-
-    status "initializing AIDE database (this can take a few minutes)"
-    if aide --init >/var/log/aide/aide-init.log 2>&1 && mv -f /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz 2>/dev/null; then
-        ok
-    else
-        warn "AIDE database initialization did not finish cleanly — see /var/log/aide/aide-init.log. The daily check will start working automatically once /var/lib/aide/aide.db.gz exists."
-    fi
-else
-    skip "aide not installed — nothing to schedule"
-fi
-
-# ========================================================
-# MISC
-# ========================================================
-print_section "Miscellaneous Hardening"
-
-status "restricting cron and at access"
-echo "root" > /etc/cron.allow
-chmod 600 /etc/cron.allow
-[ -f /etc/cron.deny ] && rm -f /etc/cron.deny
-
-if have_cmd at; then
-    echo "root" > /etc/at.allow
-    chmod 600 /etc/at.allow
-    [ -f /etc/at.deny ] && rm -f /etc/at.deny
-fi
-ok
-
-status "configuring PAM faillock"
-mkdir -p /etc/security
-backup_file /etc/security/faillock.conf
-# No /etc/pam.d/* files are touched — editing a PAM stack file is one of
-# the most reliable ways to lock every account out of a system. Confirm
-# it's wired up with: grep faillock /etc/pam.d/system-login
-cat > /etc/security/faillock.conf <<'EOF'
-# Deny access after 5 failed attempts
-deny = 5
-# Unlock time in seconds (15 minutes)
-unlock_time = 900
-# Fail interval (15 minutes)
-fail_interval = 900
-EOF
-ok
-
-status "disabling legacy/insecure services (if present and enabled)"
-# Only stops something already installed AND enabled from auto-starting
-# next boot.
-for svc in telnetd inetd xinetd tftpd rsh rlogind rexecd ypbind nis; do
-    if [ "$INIT_SYSTEM" = "openrc" ] && [ -f "/etc/init.d/$svc" ]; then
-        if rc-update show 2>/dev/null | grep -qE "^[[:space:]]*${svc}[[:space:]]*\|"; then
-            rc-update del "$svc" >/dev/null 2>&1 || true
-            info "  Disabled legacy service: $svc"
-        fi
-    elif [ "$INIT_SYSTEM" = "systemd" ] && have_cmd systemctl; then
-        if systemctl is-enabled "${svc}.service" >/dev/null 2>&1; then
-            systemctl disable "${svc}.service" >/dev/null 2>&1 && info "  Disabled legacy service: $svc"
-        fi
-    fi
-done
-ok
-
-status "ensuring a syslog daemon is enabled (if installed)"
-SYSLOG_FOUND=0
-for svc in rsyslog syslog-ng socklog-unix busybox-syslogd; do
-    if [ "$INIT_SYSTEM" = "openrc" ] && [ -f "/etc/init.d/$svc" ]; then
-        enable_boot_service "$svc" default
-        SYSLOG_FOUND=1
-        break
-    elif [ "$INIT_SYSTEM" = "systemd" ] && have_cmd systemctl && systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null | grep -q .; then
-        enable_boot_service "$svc" default
-        SYSLOG_FOUND=1
-        break
-    fi
-done
-if [ "$SYSLOG_FOUND" -eq 1 ]; then
-    ok
-elif [ "$INIT_SYSTEM" = "systemd" ]; then
-    # systemd-journald handles logging by default even with no separate
-    # syslog daemon installed, so there's always somewhere for logs to go.
-    ok
-else
-    skip "no syslog daemon found (rsyslog/syslog-ng/socklog) to enable"
-fi
-
-status "ensuring auditd is enabled (if installed)"
-if have_cmd auditd || [ -f /etc/init.d/auditd ]; then
-    enable_boot_service auditd default
-    ok
-else
-    skip "auditd not installed — nothing to configure"
-fi
-
-# All enable_boot_service calls for this run happen above this line --
-# commit and live-apply anything staged under s6 (see apply_s6_changes()).
-apply_s6_changes
-
-# ========================================================
-# FINAL PERMISSIONS
-# ========================================================
-print_section "Final File Permissions"
-
-status "setting final file permissions"
-chmod 600 /etc/ssh/ssh_config 2>/dev/null || true
-chmod 600 /etc/ssh/sshd_config.d/10-hardening.conf 2>/dev/null || true
-chmod 600 /etc/aide.conf 2>/dev/null || true
-chmod 644 /etc/profile 2>/dev/null || true
-chmod 644 /etc/bash.bashrc 2>/dev/null || true
-chmod 644 /etc/environment 2>/dev/null || true
-chmod 644 /etc/locale.conf 2>/dev/null || true
-chmod 644 /etc/locale.gen 2>/dev/null || true
-chmod 600 /etc/crypttab 2>/dev/null || true
-chmod 600 /etc/dhclient.conf 2>/dev/null || true
-chmod 644 /etc/issue /etc/issue.net 2>/dev/null || true
-chmod 644 /etc/shells /etc/securetty /etc/vconsole.conf 2>/dev/null || true
-chmod 644 /etc/makepkg.conf 2>/dev/null || true
-chmod 644 /etc/conf.d/wireless-regdom 2>/dev/null || true
-chmod 644 /etc/hosts 2>/dev/null || true
-chmod 644 /etc/hostname 2>/dev/null || true
-chmod 644 /etc/networks 2>/dev/null || true
-chmod 644 /etc/security/faillock.conf 2>/dev/null || true
-chmod 600 /etc/security/access.conf 2>/dev/null || true
-chmod 600 /etc/security/limits.conf 2>/dev/null || true
-chmod 700 /root/.ssh 2>/dev/null || true
-chmod 600 /root/.ssh/* 2>/dev/null || true
-chmod 644 /etc/hosts.allow 2>/dev/null || true
-chmod 644 /etc/hosts.deny 2>/dev/null || true
-chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null || true
-ok
-
-status "securing bootloader configuration"
-if [ -f /boot/grub/grub.cfg ]; then
-    chmod 600 /boot/grub/grub.cfg
-    chown root:root /boot/grub/grub.cfg
-fi
-if [ -d /boot/grub2 ]; then
-    chmod 600 /boot/grub2/grub.cfg 2>/dev/null || true
-    chown root:root /boot/grub2/grub.cfg 2>/dev/null || true
-fi
-if [ -d /boot/loader ]; then
-    chmod 700 /boot/loader 2>/dev/null || true
-fi
-ok
-
-# ========================================================
-# SYSTEMD SERVICE HARDENING
-# ========================================================
-# Independent of the OpenRC/runit/s6/dinit detection used above. Addresses
-# Lynis BOOT-5264 ("Consider hardening system services", checked via
-# `systemd-analyze security`) for boxes that use systemd as their init.
-print_section "Systemd Service Hardening"
-
-status "checking init system for systemd"
-if [ -d /run/systemd/system ] && have_cmd systemctl; then
-    ok
-    info "Detected systemd — sandboxing known-safe services"
-
-    # Directives applied to every candidate with no exceptions: none of
-    # them have any legitimate reason to gain new privileges, adjust the
-    # clock, use exotic namespaces, or change the hostname.
-    SYSTEMD_HARDENING_ALWAYS=$(cat <<'EOF'
-[Service]
-NoNewPrivileges=yes
-ProtectKernelTunables=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-ProtectClock=yes
-ProtectHostname=yes
-RestrictSUIDSGID=yes
-RestrictNamespaces=yes
-LockPersonality=yes
-MemoryDenyWriteExecute=yes
-RemoveIPC=yes
-SystemCallArchitectures=native
-EOF
-)
-
-    # ProtectKernelModules, RestrictRealtime, and PrivateDevices are each
-    # skipped for the specific services that genuinely rely on what they'd
-    # block, so hardening never costs real functionality:
-    #  - rtkit-daemon exists specifically to grant realtime scheduling to
-    #    other processes (audio servers, etc.) — realtime access is the
-    #    whole point of the service, so RestrictRealtime stays off for it.
-    #  - thermald may need to load the "msr" kernel module to read CPU
-    #    temperature on some hardware, so ProtectKernelModules stays off.
-    #  - CUPS may drive a USB/parallel printer, switcheroo-control switches
-    #    GPUs via /dev/dri, thermald reads CPU temperature via
-    #    /dev/cpu/*/msr, and blueman-mechanism can touch Bluetooth device
-    #    nodes — PrivateDevices stays off for all four.
-    NO_PROTECT_KERNEL_MODULES="thermald.service"
-    NO_RESTRICT_REALTIME="rtkit-daemon.service"
-    NO_PRIVATE_DEVICES="cups.service cups-browsed.service switcheroo-control.service thermald.service blueman-mechanism.service"
-
-    # Self-contained background daemons commonly flagged UNSAFE/EXPOSED/
-    # MEDIUM by `systemd-analyze security`. Anything not on this list, or
-    # not installed, is left alone entirely — dbus, NetworkManager,
-    # display managers, and most systemd-* units are deliberately
-    # excluded since a wrong guess on those can break the whole system.
-    SYSTEMD_HARDEN_CANDIDATES="cron.service crond.service anacron.service rsyslog.service avahi-daemon.service cups.service cups-browsed.service clamav-daemon.service clamav-freshclam.service fail2ban.service irqbalance.service earlyoom.service switcheroo-control.service kerneloops.service preload.service thermald.service uuidd.service accounts-daemon.service power-profiles-daemon.service rtkit-daemon.service blueman-mechanism.service dnsmasq.service networkd-dispatcher.service"
-
-    HARDENED_SERVICES=()
-    for svc in $SYSTEMD_HARDEN_CANDIDATES; do
-        if systemctl list-unit-files "$svc" --no-legend 2>/dev/null | grep -q .; then
-            status "hardening $svc"
-            OVERRIDE_DIR="/etc/systemd/system/${svc}.d"
-            mkdir -p "$OVERRIDE_DIR"
-            backup_file "${OVERRIDE_DIR}/hardening.conf"
-            {
-                printf '%s\n' "$SYSTEMD_HARDENING_ALWAYS"
-                case " $NO_PROTECT_KERNEL_MODULES " in
-                    *" $svc "*) : ;;
-                    *) printf 'ProtectKernelModules=yes\n' ;;
-                esac
-                case " $NO_RESTRICT_REALTIME " in
-                    *" $svc "*) : ;;
-                    *) printf 'RestrictRealtime=yes\n' ;;
-                esac
-                case " $NO_PRIVATE_DEVICES " in
-                    *" $svc "*) : ;;
-                    *) printf 'PrivateDevices=yes\n' ;;
-                esac
-            } > "${OVERRIDE_DIR}/hardening.conf"
-            chmod 644 "${OVERRIDE_DIR}/hardening.conf"
-            ok
-            HARDENED_SERVICES+=("$svc")
-        fi
-    done
-
-    if [ "${#HARDENED_SERVICES[@]}" -gt 0 ]; then
-        status "reloading systemd manager configuration"
-        systemctl daemon-reload
-        ok
-
-        # try-restart only restarts a service that's already running, and
-        # does nothing to one that isn't — so this applies the sandboxing
-        # immediately wherever it's safe to, with no reboot and nothing
-        # left for the user to do by hand.
-        for svc in "${HARDENED_SERVICES[@]}"; do
-            status "applying sandboxing to $svc"
-            systemctl try-restart "$svc" >/dev/null 2>&1 || true
-            ok
-        done
-    else
-        info "  No candidate services from the hardening list were found installed"
-    fi
-else
-    skip "systemd not detected"
-fi
-
-# ========================================================
-# SUMMARY
-# ========================================================
-print_section "System hardening complete"
-
-if [ "${#WARNINGS[@]}" -gt 0 ]; then
-    printf "\nWarnings from this run:\n"
-    for w in "${WARNINGS[@]}"; do
-        printf "  [!] %s\n" "$w"
-    done
-fi
-
-printf "\nBackups of anything this script overwrote: %s\n" "$BACKUP_DIR"
-
+    if ! err=$(aide --config-check -c /etc/aide.conf 2>&1); then fail "aide: config rejected: $err"; return; fi
+    pass "aide: config valid; /etc checked by content, owner and mode, not inode/ctime"
+    if [ -d /etc/cron.daily ] && { have crond || have cron || have fcron; }; then
+        put 700 /etc/cron.daily/aide-check <<EOF
+#!/bin/sh
+[ -f /var/lib/aide/aide.db.gz ] || exit 0
+nice -n 19 ionice -c 3 $(command -v aide) --check -c /etc/aide.conf > /var/log/aide/aide-check.log 2>&1
+rc=\$?
+[ "\$rc" -eq 0 ] || logger -t aide -p authpriv.warning "aide --check exit \$rc, see /var/log/aide/aide-check.log"
 exit 0
+EOF
+        pass "aide: daily check at idle priority via /etc/cron.daily, changes reported to syslog"
+    else
+        skip "aide: no cron daemon with /etc/cron.daily, daily check not scheduled"
+    fi
+    if [ "$IN_CHROOT" = 1 ]; then info "aide: chroot detected, run 'aide --init' after first boot"; return; fi
+    info "aide: building baseline, this takes a few minutes"
+    if nice -n 19 ionice -c 3 aide --init -c /etc/aide.conf > /var/log/aide/aide-init.log 2>&1 &&
+       mv -f /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz; then
+        pass "aide: baseline stored in /var/lib/aide/aide.db.gz"
+    else
+        fail "aide: --init failed, see /var/log/aide/aide-init.log"
+    fi
+}
+
+revert() {
+    local p
+    [ -d "$STATE" ] || { fail "revert: nothing recorded in $STATE"; return; }
+    if [ -f "$STATE/modes" ]; then
+        while IFS=$'\t' read -r m p; do chmod "$m" "$p" 2>/dev/null; done < "$STATE/modes"
+        pass "revert: permissions restored"
+    fi
+    if [ -d "$STATE/orig" ]; then
+        while IFS= read -r -d '' p; do
+            p=${p#"$STATE/orig"}
+            cp -a "$STATE/orig$p" "$p" && pass "revert: restored $p"
+        done < <(find "$STATE/orig" \( -type f -o -type l \) -print0)
+    fi
+    for p in iptables-restore ip6tables-restore; do
+        [ -e "$STATE/new/etc/systemd/system/$p.service" ] && systemctl disable "$p.service" >/dev/null 2>&1
+        rm -f "/run/runit/service/$p" "/var/service/$p" "/etc/runit/runsvdir/default/$p"
+    done
+    if [ -d "$STATE/new" ]; then
+        while IFS= read -r -d '' p; do
+            p=${p#"$STATE/new"}
+            rm -f "$p" && pass "revert: removed $p"
+        done < <(find "$STATE/new" -type f -print0)
+    fi
+    [ -f "$STATE/newdirs" ] && tac "$STATE/newdirs" | while IFS= read -r p; do rmdir "$p" 2>/dev/null; done
+    local fam bin rules
+    for fam in iptables ip6tables; do
+        bin=$(command -v "$fam-restore") || continue
+        rules=/etc/iptables/$fam.rules
+        if [ -f "$rules" ]; then
+            "$bin" < "$rules" && pass "revert: $fam reloaded from $rules"
+        else
+            "${bin%-restore}" -P INPUT ACCEPT; "${bin%-restore}" -P FORWARD ACCEPT; "${bin%-restore}" -P OUTPUT ACCEPT
+            "${bin%-restore}" -F; "${bin%-restore}" -X
+            pass "revert: $fam filter table open"
+        fi
+    done
+    have fail2ban-client && fail2ban-client ping >/dev/null 2>&1 && fail2ban-client reload --restart --all >/dev/null 2>&1
+    rm -rf "$STATE"
+    info "services enabled at boot stay enabled"
+}
+
+summary() {
+    printf '\n%d passed, %d failed\n' "$NPASS" "$NFAIL"
+    [ "$NFAIL" -eq 0 ]
+}
+
+main() {
+    case ${1:-} in
+        --revert) revert; summary; exit ;;
+        "") ;;
+        *) echo "usage: $0 [--revert]" >&2; exit 2 ;;
+    esac
+    mkdir -p "$STATE" && chmod 700 "$STATE"
+    info "init: $INIT$([ "$IN_CHROOT" = 1 ] && echo ' (chroot, live changes skipped)'), admin user: ${ADMIN:-unknown}"
+    legacy_repair
+    do_modules
+    do_coredumps
+    do_shell
+    do_logindefs
+    do_pam
+    do_shells
+    do_homes
+    do_cron
+    do_netprivacy
+    do_firewall
+    do_ssh
+    do_banners
+    do_services
+    do_perms
+    s6_commit
+    do_aide
+    summary
+}
+
+[ "${BASH_SOURCE[0]}" = "$0" ] && main "$@"
