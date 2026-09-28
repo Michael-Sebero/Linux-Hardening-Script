@@ -190,69 +190,6 @@ yescrypt_ok() {
     have perl && perl -e 'my $h = crypt("x", q($y$j9T$KcY5dS0bTG4I1RP2rHBaX.)); exit(defined $h && $h =~ /^\$y\$/ ? 0 : 1)'
 }
 
-pristine() {
-    local f=$1 bad=$2 d pkg ver c tmp
-    if [ -f "$f.pacnew" ]; then echo "$f.pacnew"; return; fi
-    if have pacman && have bsdtar && pkg=$(pacman -Qqo "$f" 2>/dev/null); then
-        ver=$(pacman -Q "$pkg" | awk '{print $2}')
-        for c in /var/cache/pacman/pkg/"$pkg-$ver"-*.pkg.tar.*; do
-            case $c in *.sig) continue ;; esac
-            [ -f "$c" ] || continue
-            tmp=$(mktemp)
-            if bsdtar -xOf "$c" "${f#/}" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then echo "$tmp"; return; fi
-            rm -f "$tmp"
-        done
-    fi
-    for d in /root/hardening-backups-*/; do
-        [ -f "$d${f#/}" ] || continue
-        [ "$(sha256sum < "$d${f#/}" | cut -c1-16)" = "$bad" ] && continue
-        echo "$d${f#/}"; return
-    done
-    return 1
-}
-
-legacy_repair() {
-    local ev=0 e f h src
-    ls -d /root/hardening-backups-*/ >/dev/null 2>&1 && ev=1
-    grep -qs '^install squashfs /bin/true$' /etc/modprobe.d/uncommon-filesystems.conf && ev=1
-    [ "$ev" = 1 ] || return 0
-    for e in /etc/profile:4bcb10381b732ff2 /etc/bash.bashrc:0725202b30e1f923 /etc/shells:cebbd16e1135550a \
-             /etc/login.defs:aadde12cc06385c5 /etc/ssh/ssh_config:0e89333e4bd82cb6 /etc/makepkg.conf:f92355fae445b46a \
-             /etc/host.conf:18391637e7a31586 /etc/locale.gen:433c51fe92a94ce4 /etc/locale.conf:3665a41fa8e3f8fd \
-             /etc/environment:3405a141d908ea12 /etc/vconsole.conf:733dd6663595cc62 /etc/conf.d/wireless-regdom:3c98edd20d55fb43 \
-             /etc/aide.conf:d70b34ef5c4a7417 /etc/security/faillock.conf:e3b2224b885b35ac; do
-        f=${e%%:*} h=${e#*:}
-        [ -f "$f" ] && [ "$(sha256sum < "$f" | cut -c1-16)" = "$h" ] || continue
-        if src=$(pristine "$f" "$h"); then
-            cp "$src" "$f" && pass "legacy: restored $f from $src"
-            case $src in /tmp/*) rm -f "$src" ;; *.pacnew) rm -f "$src" ;; esac
-        else
-            case $f in /etc/locale.*|/etc/environment|/etc/vconsole.conf|/etc/conf.d/*|/etc/host.conf)
-                info "legacy: $f still holds the old script's content (no pristine copy found)" ;;
-            *)  fail "legacy: $f still holds the old script's content and no pristine copy was found" ;;
-            esac
-        fi
-    done
-    for e in /etc/profile.d/bash_history.sh:6af75c770b18d579 /etc/cron.d/aide-check:f11ed3798a047dfa \
-             /etc/ssh/sshd_config.d/10-hardening.conf:7726c5006c3f4c14 /etc/modprobe.d/uncommon-filesystems.conf:a18e55c7b7c9ad79 \
-             /etc/modprobe.d/uncommon-net-protocols.conf:8eb7e1b76422a273 /etc/modprobe.d/blacklist-firewire.conf:9ea2fe8930583000; do
-        f=${e%%:*} h=${e#*:}
-        [ -f "$f" ] && [ "$(sha256sum < "$f" | cut -c1-16)" = "$h" ] && rm -f "$f" && pass "legacy: removed $f"
-    done
-    local -a units=()
-    for f in /etc/systemd/system/*.service.d/hardening.conf; do
-        [ -f "$f" ] && grep -q '^MemoryDenyWriteExecute=yes' "$f" && grep -q '^RemoveIPC=yes' "$f" || continue
-        rm -f "$f"; rmdir "${f%/*}" 2>/dev/null
-        f=${f#/etc/systemd/system/}; units+=("${f%.d/hardening.conf}")
-    done
-    if [ "${#units[@]}" -gt 0 ]; then
-        pass "legacy: removed blanket sandbox overrides from ${units[*]}"
-        if [ "$IN_CHROOT" = 0 ] && [ "$INIT" = systemd ]; then
-            systemctl daemon-reload && systemctl try-restart "${units[@]}" >/dev/null 2>&1
-        fi
-    fi
-}
-
 do_modules() {
     local inuse fs out="" kept=""
     inuse=" $({ findmnt -rno FSTYPE; findmnt --fstab -rno FSTYPE; } 2>/dev/null | sort -u | tr '\n' ' ') "
@@ -904,7 +841,6 @@ main() {
     esac
     mkdir -p "$STATE" && chmod 700 "$STATE"
     info "init: $INIT$([ "$IN_CHROOT" = 1 ] && echo ' (chroot, live changes skipped)'), admin user: ${ADMIN:-unknown}"
-    legacy_repair
     do_modules
     do_coredumps
     do_shell
